@@ -1,0 +1,50 @@
+"""Data directory: where catalog.db and the access token live."""
+
+from __future__ import annotations
+
+import os
+import secrets
+import sqlite3
+from contextlib import closing
+from pathlib import Path
+
+HOME_ENV = "RESINK_CATALOG_HOME"
+SCHEMA_VERSION = 1
+
+
+def default_home() -> Path:
+    env = os.environ.get(HOME_ENV)
+    return Path(env).expanduser() if env else Path.home() / ".resink-catalog"
+
+
+def ensure_home(home: Path) -> Path:
+    home.mkdir(parents=True, exist_ok=True)
+    if os.name == "posix":
+        home.chmod(0o700)
+    return home
+
+
+def load_or_create_token(home: Path) -> str:
+    """Return the access token, generating it on first start (file mode 0600)."""
+    path = home / "token"
+    if path.exists():
+        token = path.read_text().strip()
+        if token:
+            return token
+    token = secrets.token_urlsafe(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
+    return token
+
+
+def init_db(home: Path) -> Path:
+    """Create catalog.db with a version table. Later milestones add their own tables."""
+    db_path = home / "catalog.db"
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+            (str(SCHEMA_VERSION),),
+        )
+    return db_path
