@@ -1,0 +1,10 @@
+.git
+.venv
+web/node_modules
+web/test-results
+dist
+__pycache__
+.pytest_cache
+.ruff_cache
+.review
+.playwright-mcp

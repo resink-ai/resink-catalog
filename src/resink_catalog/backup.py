@@ -19,7 +19,8 @@ import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from .catalog import Catalog
 from .home import SCHEMA_VERSION
@@ -37,7 +38,7 @@ def _local_path(uri: str) -> Path:
     parsed = urlparse(uri)
     if parsed.scheme not in ("", "file"):
         raise BackupError(f"cannot back up {uri}: only local files are supported")
-    return Path(unquote(parsed.path))
+    return Path(url2pathname(parsed.path))  # file:///C:/x on Windows, file:///home/x elsewhere
 
 
 def referenced_files(cat: Catalog) -> set[Path]:

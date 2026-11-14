@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 import webbrowser
@@ -18,13 +19,21 @@ from .catalog import Catalog, ImportErrorForUser
 from .home import default_home, ensure_home, init_db, load_or_create_token
 
 DEFAULT_PORT = 8765
-HOST = "127.0.0.1"  # fixed on purpose: the catalog never listens on another interface
+HOST = "127.0.0.1"  # the address in every link; the catalog listens only here...
+CONTAINER_ENV = "RESINK_CATALOG_IN_CONTAINER"  # ...except inside the Docker image, see listen_host()
+
+
+def listen_host() -> str:
+    """127.0.0.1, always, except inside the Docker image (which sets RESINK_CATALOG_IN_CONTAINER=1): there the process
+    must listen on the container's interface, and the user keeps it private by publishing the port on the host's
+    127.0.0.1 only (`-p 127.0.0.1:8765:8765`). The token and the Host check apply either way."""
+    return "0.0.0.0" if os.environ.get(CONTAINER_ENV) == "1" else HOST  # noqa: S104
 
 
 def _bind(port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((HOST, port))
+    sock.bind((listen_host(), port))
     sock.listen(128)
     return sock
 

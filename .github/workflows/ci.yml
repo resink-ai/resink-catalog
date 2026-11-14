@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.12"]
+        include:
+          - {os: ubuntu-latest, python: "3.10"}
+    env:
+      # The DuckDB tests fail instead of skipping: the extensions are installed in the step below.
+      RESINK_CATALOG_REQUIRE_DUCKDB_EXTENSIONS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: uv sync --locked
+      - name: Pre-install the DuckDB extensions
+        run: uv run python scripts/install_duckdb_extensions.py
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: Web UI (npm ci, Vitest, build into the package)
+        run: sh scripts/build_ui.sh
+      - name: Python tests (offline; DuckDB tests may not skip)
+        run: uv run pytest -ra
+      - name: Wheel contains the web UI and the agent kit
+        if: runner.os != 'Windows'
+        run: sh scripts/check_wheel.sh
+      - name: End-to-end browser test
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        working-directory: web
+        run: npx playwright install --with-deps chromium && E2E_CHANNEL=chromium npx playwright test
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t resink-catalog:ci .
+      - name: The container serves on its own interface and answers /healthz
+        run: |
+          docker run -d --name rc -p 127.0.0.1:8765:8765 resink-catalog:ci
+          for i in $(seq 1 30); do curl -fs http://127.0.0.1:8765/healthz && break; sleep 1; done
+          curl -fs http://127.0.0.1:8765/healthz
+          docker logs rc | head -1 | grep -q '#token='
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/api/v1/tables)" = 401
