@@ -13,6 +13,8 @@ dependencies = [
   "pandas>=2.3.3",
   "pyiceberg[pyarrow,sql-sqlite]>=0.12.0",
   "uvicorn>=0.30",
+  # OS credential store for the push client's tokens (MIT); Linux uses a 0600 file instead
+  "keyring>=25; sys_platform == 'darwin' or sys_platform == 'win32'",
 ]
 
 [project.scripts]
