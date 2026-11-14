@@ -62,6 +62,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ki.add_argument("--codex", nargs="?", const="", metavar="DIR", help="for Codex (default ~/.codex/prompts)")
     ks.add_parser("config", help="print the MCP configuration for both tools")
+    b = sub.add_parser("backup", help="copy the catalog and every file it references to a new directory, consistently")
+    b.add_argument("dest", type=Path, help="a new or empty directory outside the catalog's own")
+    b.add_argument("--home", type=Path, default=None, help="data directory")
+    r = sub.add_parser("restore", help="restore a backup made by `backup` (to the location it was made from)")
+    r.add_argument("source", type=Path, help="the backup directory")
+    r.add_argument("--home", type=Path, default=None, help="data directory")
+    r.add_argument("--replace", action="store_true", help="move an existing catalog aside instead of refusing")
     for name, help_ in (
         ("import", "import a file, or apply the proposal for a folder added with add-folder"),
         ("add-folder", "find data files in a folder and propose tables; imports nothing"),
@@ -180,6 +187,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         cat = Catalog(args.home or default_home())
         build_server(lambda: cat).run("stdio")  # stdout carries the protocol: nothing else may print to it
+        return 0
+    if args.command in ("backup", "restore"):
+        from .backup import BackupError, backup, restore
+
+        try:
+            if args.command == "backup":
+                m = backup(args.home or default_home(), args.dest)
+                print(f"backed up {len(m['files'])} files and catalog.db to {args.dest}")
+            else:
+                m = restore(args.source, args.home or default_home(), replace=args.replace)
+                print(f"restored {len(m['files'])} files and catalog.db to {args.home or default_home()}")
+        except BackupError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
         return 0
     if args.command == "serve":
         serve(args.home or default_home(), args.port, not args.no_browser)
