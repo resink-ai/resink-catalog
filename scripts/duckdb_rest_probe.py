@@ -48,13 +48,15 @@ def main(install: bool) -> None:
 
     print("duckdb", duckdb.__version__)
     con.execute(f"CREATE SECRET (TYPE iceberg, TOKEN '{TOKEN}')")
-    for auth in ("none", "oauth2"):
+    for auth in ("none", "oauth2"):  # `none` sends no token and must be refused (401)
         try:
             con.execute(
                 f"ATTACH 'local' AS ice (TYPE iceberg, ENDPOINT 'http://127.0.0.1:{port}/iceberg', AUTHORIZATION_TYPE '{auth}')"
             )
             print(f"works   attach (AUTHORIZATION_TYPE {auth})")
-            break
+            if auth == "oauth2":
+                break
+            con.execute("DETACH ice")
         except Exception as e:
             print(f"FAILS   attach (AUTHORIZATION_TYPE {auth}): {str(e).splitlines()[0][:200]}")
     attempt(
@@ -66,8 +68,12 @@ def main(install: bool) -> None:
     attempt("pyiceberg sees the insert", lambda: cat.read_table("shop.orders")["id"].tolist())
     attempt("update", lambda: con.execute("UPDATE ice.shop.orders SET name='z' WHERE id=1").fetchall())
     attempt("delete", lambda: con.execute("DELETE FROM ice.shop.orders WHERE id=2").fetchall())
+    attempt("pyiceberg sees update and delete", lambda: cat.read_table("shop.orders").sort_values("id").values.tolist())
+    attempt("push blockers after delete", lambda: cat.push_blockers("shop.orders"))
     attempt("create schema", lambda: con.execute("CREATE SCHEMA ice.duck").fetchall())
     attempt("create table", lambda: con.execute("CREATE TABLE ice.duck.t (a INT, b VARCHAR)").fetchall())
+    attempt("insert into new table", lambda: con.execute("INSERT INTO ice.duck.t VALUES (1, 'x')").fetchall())
+    attempt("pyiceberg reads duckdb's table", lambda: cat.read_table("duck.t").values.tolist())
     attempt("create table as", lambda: con.execute("CREATE TABLE ice.duck.t2 AS SELECT 1 AS a").fetchall())
     attempt("drop table", lambda: con.execute("DROP TABLE ice.duck.t").fetchall())
     print("tables now:", [t["name"] for t in cat.list_tables()])

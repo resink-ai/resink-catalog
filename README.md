@@ -62,7 +62,22 @@ uv run pytest -s tests/test_sample_set.py  # prints the import success rate on t
 uv run python tests/samples.py /tmp/sample # writes the 50 sample files, to try add-folder by hand
 ```
 
-The DuckDB-over-REST tests are skipped unless DuckDB's `httpfs` and `iceberg` extensions are installed (a one-time download, so not part of the test run): `uv run python scripts/duckdb_rest_probe.py --install`.
+### DuckDB
+
+DuckDB can read and write the catalog through its `iceberg` extension. The token goes in a secret, and the authorization type must be `oauth2` (`none` sends no token and is refused with 401, as it should):
+
+```sql
+INSTALL httpfs; INSTALL iceberg;            -- once; DuckDB downloads them, so it needs the network that one time
+LOAD httpfs; LOAD iceberg;
+CREATE SECRET (TYPE iceberg, TOKEN '<your access token>');
+ATTACH 'local' AS ice (TYPE iceberg, ENDPOINT 'http://127.0.0.1:8765/iceberg', AUTHORIZATION_TYPE 'oauth2');
+SELECT * FROM ice.shop.orders;
+INSERT INTO ice.shop.orders VALUES (4, 'd');
+```
+
+Caveat: DuckDB `DELETE` and `UPDATE` write Iceberg delete files. They read back correctly everywhere, but push v0 refuses tables that have delete files, and `GET /api/v1/tables/{name}` reports `push_ready: false` with the blocker. Rewrite the table with the Python API or re-import the source to make it pushable again.
+
+The DuckDB tests skip themselves unless both extensions are already installed (D10: the test run never downloads anything). `uv run python scripts/duckdb_rest_probe.py [--install]` prints what works.
 
 ## Develop
 

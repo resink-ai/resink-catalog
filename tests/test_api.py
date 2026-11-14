@@ -22,7 +22,9 @@ def test_python_api_write_is_found_through_the_http_api(api, home):
     assert [(t["name"], t["rows"]) for t in tables] == [("shop.orders", 3)]
     q = api.post("/api/v1/query", json={"sql": "select sum(qty) as total from shop.orders"}).json()
     assert q == {"columns": ["total"], "rows": [[18]], "truncated": False}
-    assert api.get("/api/v1/tables/shop.orders").json()["schema"][0]["name"] == "id"
+    info = api.get("/api/v1/tables/shop.orders").json()
+    assert info["schema"][0]["name"] == "id"
+    assert info["push_ready"] is True and info["push_blockers"] == []
 
 
 def test_python_api_roundtrip(catalog):

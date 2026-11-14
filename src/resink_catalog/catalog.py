@@ -83,10 +83,28 @@ class Catalog:
                 )
         return sorted(out, key=lambda d: d["name"])
 
+    def push_blockers(self, name: str) -> list[str]:
+        """Reasons push protocol v0 would refuse this table (empty list: it can be pushed)."""
+        t = self.iceberg.load_table(split_name(name))
+        blockers = []
+        if not t.spec().is_unpartitioned():
+            blockers.append("partitioned")
+        tasks = list(t.scan().plan_files())
+        if any(task.delete_files for task in tasks):
+            blockers.append("delete files")  # written by merge-on-read engines such as DuckDB DELETE and UPDATE
+        if any(task.file.file_format.name != "PARQUET" for task in tasks):
+            blockers.append("non-Parquet data files")
+        if t.metadata.format_version not in (1, 2):
+            blockers.append(f"format version {t.metadata.format_version}")
+        return blockers
+
     def table_info(self, name: str) -> dict:
         ns, tbl = split_name(name)
         t = self.iceberg.load_table((ns, tbl))
+        blockers = self.push_blockers(name)
         return {
+            "push_ready": not blockers,
+            "push_blockers": blockers,
             "name": f"{ns}.{tbl}",
             "schema": [{"name": f.name, "type": str(f.field_type), "required": f.required} for f in t.schema().fields],
             "snapshots": [

@@ -1,7 +1,8 @@
 """Iceberg REST catalog v1 over the local PyIceberg SQL catalog (design section 4).
 
 In scope: config; namespaces (create, list, get, drop, properties); tables (list, create, load, exists, commit,
-drop, rename). Out of scope: views, multi-table transactions, scan planning, credential vending, `prefix`.
+drop, rename); multi-table commit (`transactions/commit`, added for DuckDB's writes, see multi_commit.py).
+Out of scope: views, scan planning, credential vending, `prefix`.
 Clients write data and manifest files themselves (the files are local); the server stores the table metadata.
 """
 
@@ -29,6 +30,8 @@ from pyiceberg.schema import Schema
 from pyiceberg.table import CommitTableRequest
 from pyiceberg.table.sorting import SortOrder
 from pyiceberg.table.update import AssertCreate
+
+from .multi_commit import commit_tables
 
 SEP = "\x1f"  # separator of namespace levels in a path, as the spec says
 
@@ -178,6 +181,15 @@ def build_router(get_catalog: Callable[[], IcebergCatalog]) -> APIRouter:
             "metadata-location": result.metadata_location,
             "metadata": json.loads(result.metadata.model_dump_json()),
         }
+
+    @r.post("/transactions/commit")
+    @guard
+    async def commit_transaction(request: Request) -> Response:
+        """Several tables in one all-or-nothing commit (DuckDB's write path). See multi_commit.py."""
+        body = await request.json()
+        changes = [CommitTableRequest.model_validate(c) for c in body["table-changes"]]
+        commit_tables(get_catalog(), changes)
+        return Response(status_code=204)
 
     @r.delete("/namespaces/{namespace}/tables/{table}")
     @guard
