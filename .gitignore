@@ -5,3 +5,9 @@ __pycache__/
 .ruff_cache/
 dist/
 *.egg-info/
+
+# web UI: sources are in web/, the build lands in the package (not committed; `scripts/build_ui.sh` makes it)
+web/node_modules/
+web/test-results/
+web/playwright-report/
+src/resink_catalog/static/
