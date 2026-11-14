@@ -53,3 +53,25 @@ def test_import_returns_nonzero_when_a_file_fails(tmp_path, capsys):
 def test_commands_require_a_path(cmd):
     with pytest.raises(SystemExit):
         main([cmd])
+
+
+def test_preview_and_type_override_from_the_cli(tmp_path, capsys):
+    f = tmp_path / "s.csv"
+    f.write_text("id,amount\n1,5\n2,6\n")
+    home = str(tmp_path / "h")
+    code, out = run(capsys, "preview", str(f), "--home", home, "--json")
+    view = json.loads(out)
+    assert code == 0 and [(c["name"], c["type"]) for c in view["columns"]] == [("id", "long"), ("amount", "long")]
+    code, out = run(capsys, "import", str(f), "--table", "t", "--type", "id=string", "--home", home, "--json")
+    assert code == 0 and json.loads(out)[0]["outcome"] == "created"
+    code, out = run(capsys, "preview", str(f), "--home", home)
+    assert "string" in out and "inferred long" in out  # the saved override is shown next to the inferred type
+
+
+def test_bad_type_arguments(tmp_path, capsys):
+    f = tmp_path / "s.csv"
+    f.write_text("id\n1\n")
+    assert main(["import", str(f), "--type", "oops", "--home", str(tmp_path / "h")]) == 2
+    assert main(["import", str(f), "--type", "id=varchar", "--home", str(tmp_path / "h")]) == 2
+    (tmp_path / "d").mkdir()
+    assert main(["import", str(tmp_path / "d"), "--type", "id=string", "--home", str(tmp_path / "h")]) == 2

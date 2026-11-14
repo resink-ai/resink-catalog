@@ -38,8 +38,8 @@ def test_query_token_accepted(client):
     assert client.get(f"/api/v1/info?token={TOKEN}").status_code == 200
 
 
-def test_unknown_route_with_token_is_404(client):
-    r = client.get("/nope", headers={"Authorization": f"Bearer {TOKEN}"})
+def test_unknown_api_route_with_token_is_404(client):
+    r = client.get("/api/v1/nope", headers={"Authorization": f"Bearer {TOKEN}"})
     assert r.status_code == 404
 
 

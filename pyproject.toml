@@ -1,6 +1,6 @@
 [project]
 name = "resink-catalog"
-version = "0.0.2"
+version = "0.0.3"
 description = "Local Catalog: turn data files on your computer into queryable Iceberg tables."
 readme = "README.md"
 license = "Apache-2.0"
@@ -32,6 +32,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/resink_catalog"]
+# the web UI build is git-ignored but must ship in the wheel
+artifacts = ["src/resink_catalog/static/**"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["web/node_modules", "web/test-results"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

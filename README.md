@@ -2,7 +2,7 @@
 
 Local Catalog: turns data files on your computer (CSV, Parquet, exports) into queryable Iceberg tables, and can push them to Resink cloud. Free and open source (Apache-2.0).
 
-**Status: L1 (import and Iceberg REST).** CSV and Parquet files become Iceberg tables; the catalog speaks Iceberg REST; you can query it with read-only SQL. No Web UI, MCP or push yet.
+**Status: L2 (web UI).** CSV and Parquet files become Iceberg tables; the catalog speaks Iceberg REST; you can query it with read-only SQL, and browse, review and import from a web UI. No MCP or push yet.
 
 ## Run
 
@@ -18,6 +18,19 @@ Security model:
 - Listens on `127.0.0.1` only. The host cannot be changed.
 - Every route except `GET /healthz` needs the token (`Authorization: Bearer <token>`, or `?token=` for the link the browser opens). Unknown routes also answer 401.
 - Requests whose `Host` header is not loopback are refused (DNS rebinding).
+
+## The web UI
+
+`resink-catalog serve` prints a link and opens it. The link carries the access token once; the server turns it into an `HttpOnly`, `SameSite=Strict` cookie and the page removes the token from the address bar. Without the link (or the cookie) every page and asset answers 401. Requests that use the cookie and come from another origin are refused.
+
+- **Tables:** list, schema, sample rows, snapshot history, and whether the table can be pushed to Resink cloud.
+- **Folders:** add a folder to get a proposal (nothing is imported), review a file, change inferred column types, import one file or all pending ones.
+- **SQL:** read-only queries with Ctrl+Enter; one `SELECT` only.
+- Light and dark themes follow the system, or can be forced with the button (remembered).
+
+Column types can also be set from the command line: `resink-catalog preview sales.csv` shows what was inferred, and `resink-catalog import sales.csv --type id=string --type day=date` overrides it (types: string, long, double, boolean, date, timestamp). The choice is remembered for later imports of that file. A type cannot change on a table that already exists.
+
+From a source checkout the UI has to be built once (Node 20+): `scripts/build_ui.sh`. Released wheels already contain it.
 
 ## Import your files
 
@@ -53,14 +66,19 @@ cat.query("select count(*) from shop.orders")  # read-only SQL over all tables (
 | `POST /api/v1/query` `{"sql", "limit"}` | read-only SQL; anything but one `SELECT` is refused with 400 |
 | `GET /api/v1/sources`, `POST /api/v1/roots`, `POST /api/v1/sources/import`, `POST /api/v1/sources/scan` | the same as the CLI |
 
-## Reproduce the L1 checks
+## Reproduce the checks
 
 ```bash
 uv sync
 uv run pytest                              # all tests, offline
 uv run pytest -s tests/test_sample_set.py  # prints the import success rate on the 50-file sample
 uv run python tests/samples.py /tmp/sample # writes the 50 sample files, to try add-folder by hand
+scripts/build_ui.sh                        # web: npm ci, Vitest (18 tests), production build into the package
+(cd web && npx playwright test)            # end-to-end smoke test against `serve`, drives the installed Chrome
+scripts/check_wheel.sh                     # builds the wheel and checks that it contains the UI
 ```
+
+The Playwright test uses the Chrome already on the machine (`channel: "chrome"`), so nothing is downloaded; use `E2E_CHANNEL=chromium npx playwright install chromium` for a managed browser. It needs no network after `npm ci` (D10).
 
 ### DuckDB
 

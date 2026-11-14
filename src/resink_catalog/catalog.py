@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import warnings
@@ -18,11 +19,13 @@ from pyiceberg.expressions import EqualTo
 
 from .home import default_home, ensure_home, init_db
 from .query import query_arrow, run_query
-from .readers import ReadError, detect_format, file_hash, read_file
+from .readers import ReadError, apply_types, detect_format, file_hash, read_file, type_name
 from .store import DEFAULT_NAMESPACE, open_iceberg, slug, split_name
 
 SOURCE_COLUMN = "_source_file"  # present in tables built from several export files of one source
-SOURCE_FIELDS = "id root_id path format content_hash target_table mode last_import status error rows".split()
+SOURCE_FIELDS = (
+    "id root_id path format content_hash target_table mode last_import status error rows column_types".split()
+)
 DATE_PARTS = re.compile(r"(\d{4}[-_]?\d{2}[-_]?\d{2}|\d{8}|\d{4}[-_]\d{2}|\d+)")
 
 
@@ -112,6 +115,7 @@ class Catalog:
                     "snapshot_id": s.snapshot_id,
                     "timestamp_ms": s.timestamp_ms,
                     "operation": s.summary.operation.value,
+                    **_counts(s),
                 }
                 for s in t.metadata.snapshots
             ],
@@ -176,7 +180,73 @@ class Catalog:
                 q + (" WHERE status = ?" if status else "") + " ORDER BY path",
                 (status,) if status else (),
             )
-            return [dict(r) for r in rows]
+            return [_source_dict(r) for r in rows]
+
+    def roots(self) -> list[dict]:
+        """Added folders with the number of sources in each status."""
+        with closing(self._conn()) as conn:
+            roots = [dict(r) for r in conn.execute("SELECT id, path, name, last_scan FROM data_roots ORDER BY path")]
+            for r in roots:
+                counts = conn.execute(
+                    "SELECT status, COUNT(*) AS n FROM data_sources WHERE root_id = ? GROUP BY status", (r["id"],)
+                )
+                r["counts"] = {c["status"]: c["n"] for c in counts}
+        return roots
+
+    def source(self, source_id: int) -> dict:
+        with closing(self._conn()) as conn:
+            row = conn.execute(
+                f"SELECT {', '.join(SOURCE_FIELDS)} FROM data_sources WHERE id = ?", (source_id,)
+            ).fetchone()
+        if row is None:
+            raise ImportErrorForUser(f"unknown source {source_id}")
+        return _source_dict(row)
+
+    def preview(self, source_id: int, limit: int = 20) -> dict:
+        """What importing this source would produce: inferred types, the user's overrides and sample rows."""
+        src = self.source(source_id)
+        out: dict[str, Any] = {"source": src, "columns": [], "rows": [], "error": None}
+        try:
+            inferred = read_file(Path(src["path"]), src["format"])
+        except (ReadError, OSError) as e:
+            out["error"] = str(e)
+            return out
+        overrides = src["column_types"] or {}
+        out["columns"] = [
+            {"name": f.name, "inferred": type_name(f.type), "type": overrides.get(f.name, type_name(f.type))}
+            for f in inferred.schema
+        ]
+        out["total_rows"] = inferred.num_rows
+        try:
+            shown = apply_types(inferred, overrides)
+        except ReadError as e:
+            out["error"] = str(e)  # the override does not fit the data; show the data as inferred
+            shown = inferred
+        out["rows"] = json.loads(json.dumps(shown.slice(0, limit).to_pylist(), default=str))
+        return out
+
+    def set_types(self, source_id: int, column_types: dict[str, str]) -> dict:
+        """Save the user's column type choices for a source; they are used by every import of it."""
+        from .readers import TYPE_NAMES
+
+        bad = {c: t for c, t in column_types.items() if t not in TYPE_NAMES}
+        if bad:
+            raise ImportErrorForUser(f"unknown type {bad}; choose one of {', '.join(TYPE_NAMES)}")
+        self.source(source_id)
+        with closing(self._conn()) as conn, conn:
+            conn.execute(
+                "UPDATE data_sources SET column_types = ? WHERE id = ?",
+                (json.dumps(column_types) if column_types else None, source_id),
+            )
+        return self.source(source_id)
+
+    def sample(self, name: str, limit: int = 20) -> dict:
+        t = self.iceberg.load_table(split_name(name))
+        data = t.scan(limit=limit).to_arrow()
+        return {
+            "columns": data.column_names,
+            "rows": json.loads(json.dumps([list(r.values()) for r in data.to_pylist()], default=str)),
+        }
 
     def add_folder(self, folder: Path | str) -> list[dict]:
         """Propose: find data files, group exports of the same source, choose target tables. Imports nothing."""
@@ -210,8 +280,8 @@ class Catalog:
                 )
         return [s for s in self.sources() if s["root_id"] == root_id]
 
-    def import_file(self, path: Path | str, table: str | None = None) -> ImportResult:
-        """Import one file now. Without `table` it goes to default.<file name>."""
+    def register_file(self, path: Path | str, table: str | None = None) -> int:
+        """Make a single file a source (status `proposed`) without importing it. Returns the source id."""
         p = Path(path).expanduser().resolve()
         fmt = detect_format(p)
         if not p.is_file() or fmt is None:
@@ -230,6 +300,16 @@ class Catalog:
                 source_id = row["id"]
                 if table and table != row["target_table"]:
                     conn.execute("UPDATE data_sources SET target_table = ? WHERE id = ?", (table, source_id))
+        return source_id
+
+    def import_file(
+        self, path: Path | str, table: str | None = None, column_types: dict[str, str] | None = None
+    ) -> ImportResult:
+        """Import one file now. Without `table` it goes to default.<file name>. `column_types` overrides the
+        inferred types (and is remembered for later imports of the same file)."""
+        source_id = self.register_file(path, table)
+        if column_types is not None:
+            self.set_types(source_id, column_types)
         return self.import_source(source_id)
 
     def import_folder(self, folder: Path | str) -> list[ImportResult]:
@@ -258,7 +338,7 @@ class Catalog:
         if src["status"] == "imported" and src["content_hash"] == digest and self._exists(target):
             return ImportResult(source_id, src["path"], target, "unchanged", src["rows"])
         try:
-            data = read_file(path, src["format"])
+            data = apply_types(read_file(path, src["format"]), json.loads(src["column_types"] or "{}"))
             source_file = None
             if src["mode"] == "append":
                 data = data.append_column(SOURCE_COLUMN, pa.array([path.name] * data.num_rows, pa.string()))
@@ -267,7 +347,10 @@ class Catalog:
         except ReadError as e:
             return self._finish(src, "error", error=str(e))
         except Exception as e:  # a schema clash or Iceberg refusal: report it on the source, keep going
-            return self._finish(src, "error", error=f"{type(e).__name__}: {e}")
+            hint = ""
+            if "type" in str(e).lower() and self._exists(target):
+                hint = " (a column type cannot change on a table that already exists: drop the table and import again)"
+            return self._finish(src, "error", error=f"{type(e).__name__}: {e}{hint}")
         return self._finish(src, "created" if created else "updated", rows=rows, digest=digest)
 
     def _exists(self, name: str) -> bool:
@@ -333,6 +416,21 @@ class Catalog:
     def _set_status(self, source_id: int, status: str) -> None:
         with closing(self._conn()) as conn, conn:
             conn.execute("UPDATE data_sources SET status = ? WHERE id = ?", (status, source_id))
+
+
+def _counts(snapshot) -> dict:
+    props = snapshot.summary.additional_properties if snapshot.summary else {}
+    return {
+        "added_records": int(props.get("added-records", 0)),
+        "deleted_records": int(props.get("deleted-records", 0)),
+        "total_records": int(props.get("total-records", 0)),
+    }
+
+
+def _source_dict(row) -> dict:
+    d = dict(row)
+    d["column_types"] = json.loads(d["column_types"]) if d.get("column_types") else {}
+    return d
 
 
 def _align(data: pa.Table, table) -> pa.Table:
