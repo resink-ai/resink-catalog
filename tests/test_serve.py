@@ -27,7 +27,7 @@ def server(tmp_path):
         text=True,
     )
     line = proc.stdout.readline()
-    m = re.search(r"http://127\.0\.0\.1:(\d+)/\?token=(\S+)", line)
+    m = re.search(r"http://127\.0\.0\.1:(\d+)/#token=(\S+)", line)
     assert m, line
     yield f"http://127.0.0.1:{m.group(1)}", m.group(2)
     proc.terminate()

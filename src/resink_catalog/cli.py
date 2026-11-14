@@ -35,7 +35,7 @@ def serve(home: Path, port: int, open_browser: bool) -> None:  # noqa: PLR0913
     token = load_or_create_token(home)
     sock = _bind(port)
     actual_port = sock.getsockname()[1]
-    url = f"http://{HOST}:{actual_port}/?token={token}"
+    url = f"http://{HOST}:{actual_port}/#token={token}"  # a fragment is never sent to any server
     # First line of output is the URL; tests and scripts rely on it.
     print(f"resink-catalog {__version__} listening on {url}", flush=True)
     if open_browser:

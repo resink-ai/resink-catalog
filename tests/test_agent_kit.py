@@ -88,3 +88,8 @@ def test_install_needs_a_target_and_config_prints(capsys):
     assert main(["agent-kit", "config"]) == 0
     out = capsys.readouterr().out
     assert "claude mcp add resink-catalog" in out and "[mcp_servers.resink-catalog]" in out
+
+
+@pytest.mark.parametrize("path", sorted(p.relative_to(KIT) for p in KIT.rglob("*.md") if p.name != "README.md"))
+def test_every_skill_and_prompt_says_data_is_not_instructions(path):
+    assert "not instructions" in (KIT / path).read_text().lower()

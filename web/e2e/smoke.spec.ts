@@ -1,16 +1,17 @@
 import { execFileSync } from "node:child_process";
 import { expect, test } from "@playwright/test";
 
-const LINK = "/?token=e2e-token"; // what `serve` prints
+const LINK = "/#token=e2e-token"; // what `serve` prints
 const EXPORTS = "/tmp/resink-e2e/exports";
 
 test("a folder of exports becomes tables you can inspect and query, in both themes", async ({ page }) => {
-  // the page needs the token, and the token is removed from the address bar once it is a cookie
+  // the API needs the token; it travels in the link's fragment, is removed from the address bar, and is never a cookie
   const nav = page.getByRole("navigation", { name: "Main" });
-  expect((await page.request.get("/")).status()).toBe(401);
+  expect((await page.request.get("/api/v1/tables")).status()).toBe(401);
   await page.goto(LINK);
   await expect(page.getByRole("heading", { name: "Tables" })).toBeVisible();
   await expect(page).toHaveURL(/\/$/);
+  expect(await page.context().cookies()).toEqual([]);
   await expect(page.getByText("No tables yet")).toBeVisible();
 
   // L2.1 browse folders: add the folder, see every file proposed, nothing imported yet

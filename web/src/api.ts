@@ -1,5 +1,6 @@
-// Thin client for the local API. The access token travels in an HttpOnly cookie set when the browser opened the
-// link printed by `resink-catalog serve`, so nothing here ever touches it.
+// Thin client for the local API. The access token comes from the link printed by `resink-catalog serve` (see token.ts)
+// and is sent as a Bearer header; nothing is stored in a cookie.
+import { getToken } from "./token";
 
 export class ApiError extends Error {
   constructor(
@@ -11,7 +12,7 @@ export class ApiError extends Error {
 }
 
 export type Author = "user" | "ai";
-export type Tag = { tag: string; source: Author };
+export type Tag = { id: number; tag: string; source: Author };
 export type Note = { id: number; target: string; body: string; author: Author; created_at: string };
 export type TableSummary = { name: string; columns: string[]; snapshots: number; rows: number; tags: Tag[] };
 export type Snapshot = {
@@ -26,6 +27,8 @@ export type TableInfo = {
   name: string;
   tags: Tag[];
   notes: Note[];
+  notes_total: number; // notes come a page at a time
+  notes_next: number | null; // pass as notes_after for the next page
   push_ready: boolean;
   push_blockers: string[];
   schema: { name: string; type: string; required: boolean }[];
@@ -61,8 +64,10 @@ export const TYPE_NAMES = ["string", "long", "double", "boolean", "date", "times
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
-    credentials: "same-origin",
-    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    headers: {
+      ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}),
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!res.ok) {
@@ -82,10 +87,11 @@ const enc = encodeURIComponent;
 
 export const api = {
   tables: () => call<TableSummary[]>("GET", "/api/v1/tables"),
-  table: (name: string) => call<TableInfo>("GET", `/api/v1/tables/${enc(name)}`),
+  table: (name: string, notesAfter = 0) =>
+    call<TableInfo>("GET", `/api/v1/tables/${enc(name)}${notesAfter ? `?notes_after=${notesAfter}` : ""}`),
   sample: (name: string) => call<Sample>("GET", `/api/v1/tables/${enc(name)}/sample?limit=20`),
   addTags: (name: string, tags: string[]) => call<unknown>("POST", `/api/v1/tables/${enc(name)}/tags`, { tags }),
-  removeTag: (name: string, tag: string) => call<unknown>("DELETE", `/api/v1/tables/${enc(name)}/tags/${enc(tag)}`),
+  removeTag: (id: number) => call<unknown>("DELETE", `/api/v1/tags/${id}`), // by id: a tag may contain "/"
   addNote: (name: string, body: string, target?: string) =>
     call<Note>("POST", `/api/v1/tables/${enc(name)}/notes`, { body, target }),
   removeNote: (id: number) => call<unknown>("DELETE", `/api/v1/notes/${id}`),

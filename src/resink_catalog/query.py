@@ -45,7 +45,16 @@ def _mentioned(catalog: IcebergCatalog, sql: str) -> list[tuple[str, str]]:
 
 def query_arrow(catalog: IcebergCatalog, sql: str, limit: int | None = None) -> pa.Table:
     """Run a read-only query; `limit` (if given) is pushed into the SQL."""
-    con = duckdb.connect(config={"enable_external_access": False})
+    # No file, network or extension access, whatever the SQL says: external access off, extensions neither
+    # auto-installed nor auto-loaded, and the settings locked so a statement cannot switch them back on.
+    con = duckdb.connect(
+        config={
+            "enable_external_access": False,
+            "autoinstall_known_extensions": False,
+            "autoload_known_extensions": False,
+        }
+    )
+    con.execute("SET lock_configuration = true")
     try:
         check_read_only(con, sql)
         for i, ident in enumerate(_mentioned(catalog, sql)):

@@ -16,12 +16,12 @@ The first line printed is the URL with your access token. The token is created o
 
 Security model:
 - Listens on `127.0.0.1` only. The host cannot be changed.
-- Every route except `GET /healthz` needs the token (`Authorization: Bearer <token>`, or `?token=` for the link the browser opens). Unknown routes also answer 401.
+- Every route except `GET /healthz` needs the token (`Authorization: Bearer <token>`); the page's own files carry no data and are public.
 - Requests whose `Host` header is not loopback are refused (DNS rebinding).
 
 ## The web UI
 
-`resink-catalog serve` prints a link and opens it. The link carries the access token once; the server turns it into an `HttpOnly`, `SameSite=Strict` cookie and the page removes the token from the address bar. Without the link (or the cookie) every page and asset answers 401. Requests that use the cookie and come from another origin are refused.
+`resink-catalog serve` prints a link and opens it. The link carries the access token in the URL *fragment* (`/#token=...`), which browsers never send to any server. The page keeps it in memory and in `sessionStorage` (this tab, this origin including the port), removes it from the address bar, and sends it as a Bearer header. There is no cookie: a cookie would go to every service on `127.0.0.1`, whatever its port. Browser requests with another `Origin` are refused.
 
 - **Tables:** list, schema, sample rows, snapshot history, and whether the table can be pushed to Resink cloud.
 - **Folders:** add a folder to get a proposal (nothing is imported), review a file, change inferred column types, import one file or all pending ones.

@@ -23,6 +23,8 @@ const info = {
   name: "shop.orders",
   push_ready: true,
   tags: [],
+  notes_total: 0,
+  notes_next: null,
   notes: [],
   push_blockers: [],
   location: "x",
@@ -152,9 +154,10 @@ test("what the AI wrote is marked ai, what the user wrote is marked you", async 
     "GET /api/v1/tables/shop.orders": {
       ...info,
       tags: [
-        { tag: "sales", source: "ai" },
-        { tag: "finance", source: "user" },
+        { id: 1, tag: "sales", source: "ai" },
+        { id: 2, tag: "finance", source: "user" },
       ],
+      notes_total: 2,
       notes: [
         { id: 1, target: "shop.orders", body: "One row per order.", author: "ai", created_at: "2026-11-14T10:00:00+00:00" },
         { id: 2, target: "shop.orders.id", body: "Order number.", author: "user", created_at: "2026-11-14T11:00:00+00:00" },
@@ -178,7 +181,7 @@ test("what the AI wrote is marked ai, what the user wrote is marked you", async 
 test("adding a note and a tag, and deleting a note, call the API and reload", async () => {
   let notes: unknown[] = [];
   const f = routes({
-    "GET /api/v1/tables/shop.orders": () => ({ ...info, tags: [], notes }),
+    "GET /api/v1/tables/shop.orders": () => ({ ...info, tags: [], notes, notes_total: notes.length }),
     "POST /api/v1/tables/shop.orders/notes": (_u: string, init?: RequestInit) => {
       notes = [{ id: 9, target: JSON.parse(String(init?.body)).target, body: JSON.parse(String(init?.body)).body, author: "user", created_at: "2026-11-14T10:00:00+00:00" }];
       return notes[0];
@@ -202,4 +205,21 @@ test("adding a note and a tag, and deleting a note, call the API and reload", as
   await waitFor(() => expect(f.mock.calls.some((c) => String(c[0]).endsWith("/tags"))).toBe(true));
   await userEvent.click(screen.getByRole("button", { name: "Delete note 9" }));
   expect(await screen.findByText("No notes yet.")).toBeInTheDocument();
+});
+
+test("long note lists come a page at a time, with a button for the next page", async () => {
+  const note = (id: number) => ({ id, target: "shop.orders", body: `note ${id}`, author: "ai", created_at: "2026-11-14T10:00:00+00:00" });
+  const f = routes({
+    "GET /api/v1/tables/shop.orders": (url: string) =>
+      url.includes("notes_after=2")
+        ? { ...info, notes: [note(3)], notes_total: 3, notes_next: null }
+        : { ...info, notes: [note(1), note(2)], notes_total: 3, notes_next: 2 },
+  });
+  render(<TableDetail name="shop.orders" />);
+  await userEvent.click(await screen.findByRole("tab", { name: /Notes and tags \(3\)/ }));
+  expect(screen.queryByText("note 3")).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Show more notes (2 of 3)" }));
+  expect(await screen.findByText("note 3")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /Show more notes/ })).toBeNull();
+  expect(f).toBeDefined();
 });

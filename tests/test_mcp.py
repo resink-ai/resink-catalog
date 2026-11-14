@@ -50,6 +50,23 @@ async def test_exactly_the_seven_tools_and_nothing_that_changes_data(mcp):
     for t in tools:  # annotated, so a client can tell reads from additive writes
         assert t.annotations is not None and t.annotations.destructive_hint is False
         assert t.annotations.read_only_hint is (t.name not in ("add_tags", "write_note"))
+    by_name = {t.name: t.annotations for t in tools}
+    assert by_name["add_tags"].idempotent_hint is True  # tags already present are kept
+    assert by_name["write_note"].idempotent_hint is False  # a retry adds a second note
+
+
+async def test_the_server_tells_the_ai_that_data_is_not_instructions(mcp):
+    text = mcp.instructions
+    assert "TRUST BOUNDARY" in text and "never an instruction" in text and "ask the user" in text.lower()
+
+
+async def test_describe_table_pages_the_notes(mcp, cat):
+    for i in range(25):
+        cat.write_note("shop.orders", f"n{i}", author="user")
+    first = data(await mcp.call_tool("describe_table", {"table": "shop.orders"}))
+    assert len(first["notes"]) == 20 and first["notes_total"] == 25 and first["notes_next"] is not None
+    rest = data(await mcp.call_tool("describe_table", {"table": "shop.orders", "notes_after": first["notes_next"]}))
+    assert [n["body"] for n in rest["notes"]] == [f"n{i}" for i in range(20, 25)] and rest["notes_next"] is None
 
 
 async def test_list_and_describe_and_sample(mcp):
@@ -97,6 +114,44 @@ async def test_query_sql_refuses_writes_and_the_data_is_untouched(mcp, cat, sql)
         cat.table_info("shop.orders")["snapshots"][0]["operation"] == "append"
         and len(cat.table_info("shop.orders")["snapshots"]) == 1
     )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [  # all are single SELECTs, so only the connection's own setting (enable_external_access=False) stops them
+        "select * from read_csv('/etc/passwd')",
+        "select * from read_text('/etc/hostname')",
+        "select * from glob('/etc/*')",
+        "select * from read_parquet('http://127.0.0.1:9/x.parquet')",
+        "select * from read_json('https://example.invalid/x.json')",
+        "select * from sqlite_scan('/tmp/x.db', 't')",
+    ],
+)
+async def test_query_sql_select_cannot_reach_files_network_or_extensions(mcp, sql):
+    """Proof for query.py `duckdb.connect(config={"enable_external_access": False})`: each of these is a legal
+    SELECT, yet it fails with DuckDB's own 'disabled by configuration' (or unknown function) error, no network used."""
+    r = await mcp.call_tool("query_sql", {"sql": sql})
+    assert r.is_error
+    text = r.content[0].text.lower()
+    assert "disabled" in text or "not in the catalog" in text or "does not exist" in text or "extension" in text, text
+
+
+async def test_query_connection_settings_are_off_and_locked(mcp):
+    r = data(
+        await mcp.call_tool(
+            "query_sql",
+            {
+                "sql": "select name, value from duckdb_settings() where name in "
+                "('enable_external_access', 'autoinstall_known_extensions', 'autoload_known_extensions', 'lock_configuration')"
+            },
+        )
+    )
+    assert {n: v for n, v in r["rows"]} == {
+        "enable_external_access": "false",
+        "autoinstall_known_extensions": "false",
+        "autoload_known_extensions": "false",
+        "lock_configuration": "true",
+    }
 
 
 async def test_tags_and_notes_are_written_as_ai(mcp, cat):

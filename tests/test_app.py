@@ -17,7 +17,7 @@ def test_healthz_is_public(client):
     assert r.json() == {"status": "ok"}
 
 
-@pytest.mark.parametrize("path", ["/api/v1/info", "/", "/iceberg/v1/config", "/nope/at/all"])
+@pytest.mark.parametrize("path", ["/api/v1/info", "/iceberg/v1/config", "/mcp", "/mcp/", "/api/nope"])
 def test_everything_else_requires_token(client, path):
     r = client.get(path)
     assert r.status_code == 401
@@ -34,8 +34,8 @@ def test_bearer_token_accepted(client):
     assert r.json()["name"] == "resink-catalog"
 
 
-def test_query_token_accepted(client):
-    assert client.get(f"/api/v1/info?token={TOKEN}").status_code == 200
+def test_a_token_in_the_query_string_is_not_accepted(client):
+    assert client.get(f"/api/v1/info?token={TOKEN}").status_code == 401
 
 
 def test_unknown_api_route_with_token_is_404(client):

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type Author, type Sample, type TableInfo, type TableSummary } from "./api";
+import { api, type Author, type Note, type Sample, type TableInfo, type TableSummary } from "./api";
 import { Badge, DataTable, ErrorNote } from "./components";
 
 type Tab = "schema" | "sample" | "snapshots" | "notes";
@@ -77,7 +77,7 @@ export function TableDetail({ name }: { name: string }) {
       <div role="tablist" aria-label="Table views" className="tabs">
         {(["schema", "sample", "snapshots", "notes"] as Tab[]).map((t) => (
           <button key={t} role="tab" aria-selected={tab === t} onClick={() => setTab(t)}>
-            {t === "schema" ? "Schema" : t === "sample" ? "Sample rows" : t === "snapshots" ? "Snapshot history" : `Notes and tags (${info.notes.length + info.tags.length})`}
+            {t === "schema" ? "Schema" : t === "sample" ? "Sample rows" : t === "snapshots" ? "Snapshot history" : `Notes and tags (${info.notes_total + info.tags.length})`}
           </button>
         ))}
       </div>
@@ -136,6 +136,10 @@ function Annotations({ info, onChange }: { info: TableInfo; onChange: () => void
   const [note, setNote] = useState("");
   const [target, setTarget] = useState(info.name);
   const [error, setError] = useState<string | null>(null);
+  const [more, setMore] = useState<{ notes: Note[]; next: number | null } | null>(null); // later pages
+  useEffect(() => setMore(null), [info]); // a reload starts again from the first page
+  const notes = [...info.notes, ...(more?.notes ?? [])];
+  const next = more ? more.next : info.notes_next;
   const run = async (fn: () => Promise<unknown>) => {
     setError(null);
     try {
@@ -151,9 +155,9 @@ function Annotations({ info, onChange }: { info: TableInfo; onChange: () => void
       <h3>Tags</h3>
       <ul className="tag-list" aria-label="Tags (editable)">
         {info.tags.map((t) => (
-          <li key={t.tag} className={`tag ${t.source}`}>
+          <li key={t.id} className={`tag ${t.source}`}>
             {t.tag} <AuthorBadge author={t.source} />
-            <button className="ghost small" aria-label={`Remove tag ${t.tag}`} onClick={() => void run(() => api.removeTag(info.name, t.tag))}>
+            <button className="ghost small" aria-label={`Remove tag ${t.tag}`} onClick={() => void run(() => api.removeTag(t.id))}>
               ×
             </button>
           </li>
@@ -165,9 +169,9 @@ function Annotations({ info, onChange }: { info: TableInfo; onChange: () => void
         <button type="submit" disabled={!tag.trim()}>Add</button>
       </form>
       <h3>Notes</h3>
-      {info.notes.length === 0 && <p className="muted">No notes yet.</p>}
+      {notes.length === 0 && <p className="muted">No notes yet.</p>}
       <ul className="notes">
-        {info.notes.map((n) => (
+        {notes.map((n) => (
           <li key={n.id} className={`note ${n.author}`}>
             <div className="row between">
               <span>
@@ -182,6 +186,19 @@ function Annotations({ info, onChange }: { info: TableInfo; onChange: () => void
           </li>
         ))}
       </ul>
+      {next !== null && (
+        <button
+          className="ghost"
+          onClick={() =>
+            api
+              .table(info.name, next)
+              .then((page) => setMore({ notes: [...(more?.notes ?? []), ...page.notes], next: page.notes_next }))
+              .catch((e) => setError((e as Error).message))
+          }
+        >
+          Show more notes ({notes.length} of {info.notes_total})
+        </button>
+      )}
       <form onSubmit={(e) => { e.preventDefault(); if (note.trim()) void run(async () => { await api.addNote(info.name, note, target); setNote(""); }); }}>
         <div className="row">
           <label htmlFor="note-target">About</label>

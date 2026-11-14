@@ -1,4 +1,6 @@
-"""FastAPI app. Every route except /healthz requires the access token."""
+"""FastAPI app. The API, Iceberg and MCP routes need the access token in an Authorization header. The web page's own
+files (HTML, JS, CSS) carry no data and are served without it: the browser opens the link with the token in the URL
+fragment, which is never sent to any server, and the page sends the token as a header."""
 
 from __future__ import annotations
 
@@ -20,10 +22,10 @@ from .mcp_server import build_server
 from .query import QueryError
 
 PUBLIC_PATHS = frozenset({"/healthz"})
+PROTECTED_PREFIXES = ("/api/", "/iceberg/", "/mcp")  # everything else is the page's own static files
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
 
 
-COOKIE = "rc_token"
 STATIC_DIR = Path(__file__).parent / "static"
 NO_UI = (
     "<!doctype html><meta charset=utf-8><title>Resink Catalog</title>"
@@ -34,17 +36,9 @@ NO_UI = (
 )
 
 
-def _extract_token(request: Request) -> tuple[str | None, str]:
-    """The supplied token and where it came from: 'header', 'query' or 'cookie'."""
-    auth = request.headers.get("authorization", "")
-    scheme, _, value = auth.partition(" ")
-    if scheme.lower() == "bearer" and value:
-        return value.strip(), "header"
-    # The browser is opened on a link carrying the token (design section 4); it is then kept in a cookie so the
-    # page's scripts and API calls carry it without JavaScript ever handling it.
-    if "token" in request.query_params:
-        return request.query_params["token"], "query"
-    return request.cookies.get(COOKIE), "cookie"
+def _bearer(request: Request) -> str | None:
+    scheme, _, value = request.headers.get("authorization", "").partition(" ")
+    return value.strip() if scheme.lower() == "bearer" and value else None
 
 
 class QueryBody(BaseModel):
@@ -107,9 +101,9 @@ def create_app(token: str, home: Path | str | None = None) -> FastAPI:
         host = request.headers.get("host", "").rsplit(":", 1)[0]
         if host not in LOOPBACK_HOSTS:  # blocks DNS rebinding
             return JSONResponse({"detail": "forbidden host"}, status_code=403)
-        via = "none"
-        if request.url.path not in PUBLIC_PATHS:
-            supplied, via = _extract_token(request)
+        path = request.url.path
+        if path not in PUBLIC_PATHS and (path + "/").startswith(PROTECTED_PREFIXES):
+            supplied = _bearer(request)
             if supplied is None or not secrets.compare_digest(supplied, token):
                 return JSONResponse(
                     {"detail": "missing or invalid access token"},
@@ -117,13 +111,10 @@ def create_app(token: str, home: Path | str | None = None) -> FastAPI:
                     headers={"WWW-Authenticate": "Bearer"},
                 )
             origin = request.headers.get("origin")
-            if via == "cookie" and request.method not in ("GET", "HEAD") and origin:
-                if origin.split("://", 1)[-1] != request.headers.get("host"):  # another site or port using our cookie
+            if origin and request.method not in ("GET", "HEAD"):
+                if origin.split("://", 1)[-1] != request.headers.get("host"):  # a page on another port or site
                     return JSONResponse({"detail": "cross-origin request refused"}, status_code=403)
-        response = await call_next(request)
-        if via == "query":
-            response.set_cookie(COOKIE, token, httponly=True, samesite="strict", path="/")
-        return response
+        return await call_next(request)
 
     @app.get("/healthz")
     def healthz() -> dict:
@@ -156,9 +147,9 @@ def create_app(token: str, home: Path | str | None = None) -> FastAPI:
             raise HTTPException(404, f"no such table: {name}") from None
 
     @app.get("/api/v1/tables/{name}")
-    def table(name: str) -> dict:
+    def table(name: str, notes_after: int = 0, notes_limit: int = 50) -> dict:
         try:
-            return catalog().table_info(name)
+            return catalog().table_info(name, notes_after, notes_limit)
         except (NoSuchTableError, NoSuchNamespaceError):
             raise HTTPException(404, f"no such table: {name}") from None
 
@@ -174,11 +165,11 @@ def create_app(token: str, home: Path | str | None = None) -> FastAPI:
     def add_tags(name: str, body: TagsBody) -> list[dict]:
         return catalog().add_tags(name, body.tags, source="user")
 
-    @app.delete("/api/v1/tables/{name}/tags/{tag}")
-    def remove_tag(name: str, tag: str) -> dict:
-        if not catalog().remove_tag(name, tag):
-            raise HTTPException(404, f"no such tag: {tag}")
-        return {"removed": tag}
+    @app.delete("/api/v1/tags/{tag_id}")
+    def remove_tag(tag_id: int) -> dict:
+        if not catalog().remove_tag(tag_id):
+            raise HTTPException(404, f"no such tag: {tag_id}")
+        return {"removed": tag_id}
 
     @app.post("/api/v1/tables/{name}/notes")
     def add_note(name: str, body: NoteBody) -> dict:

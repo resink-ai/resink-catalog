@@ -34,6 +34,13 @@ DATE_PARTS = re.compile(r"(\d{4}[-_]?\d{2}[-_]?\d{2}|\d{8}|\d{4}[-_]\d{2}|\d+)")
 
 SOURCES_OF_TEXT = ("user", "ai")  # who wrote a tag or note
 MAX_TAG, MAX_TAGS_PER_CALL, MAX_NOTE = 64, 20, 5000
+# Cumulative limits, so a looping or injected assistant cannot fill the disk or the reader's context. The AI's
+# limits are lower than the user's, so it can never use up the room the user needs.
+LIMITS = {
+    "ai": {"tags_per_table": 30, "notes_per_table": 100, "notes_total": 5000},
+    "user": {"tags_per_table": 100, "notes_per_table": 1000, "notes_total": 50000},
+}
+NOTES_PAGE = 50
 
 
 class ImportErrorForUser(Exception):
@@ -105,7 +112,7 @@ class Catalog:
     def list_tables(self) -> list[dict]:
         tags: dict[str, list[dict]] = defaultdict(list)
         for t in self.list_tags():
-            tags[t["table"]].append({"tag": t["tag"], "source": t["source"]})
+            tags[t["table"]].append({"id": t["id"], "tag": t["tag"], "source": t["source"]})
         out = []
         for ns in self.iceberg.list_namespaces():
             for ident in self.iceberg.list_tables(ns):
@@ -177,6 +184,13 @@ class Catalog:
             raise ImportErrorForUser(f"a tag is at most {MAX_TAG} characters on one line")
         name = self._canonical(table)
         with closing(self._conn()) as conn, conn:
+            have = {r[0] for r in conn.execute("SELECT tag FROM tags WHERE table_name = ?", (name,))}
+            by_author = conn.execute(
+                "SELECT COUNT(*) FROM tags WHERE table_name = ? AND source = ?", (name, source)
+            ).fetchone()[0]
+            if by_author + len([t for t in cleaned if t not in have]) > LIMITS[source]["tags_per_table"]:
+                limit = LIMITS[source]["tags_per_table"]
+                raise ImportErrorForUser(f"{name} already has {by_author} tags from {source}; the limit is {limit}")
             for tag in cleaned:
                 conn.execute(
                     "INSERT OR IGNORE INTO tags (table_name, tag, source, created_at) VALUES (?, ?, ?, ?)",
@@ -193,12 +207,10 @@ class Catalog:
                 args = (self._canonical(table),)
             return [dict(r) for r in conn.execute(q + " ORDER BY table_name, tag", args)]
 
-    def remove_tag(self, table: str, tag: str) -> bool:
+    def remove_tag(self, tag_id: int) -> bool:
+        """Delete by id: a tag may contain any character, including '/', which cannot travel in a URL path."""
         with closing(self._conn()) as conn, conn:
-            cur = conn.execute(
-                "DELETE FROM tags WHERE table_name = ? AND tag = ?", (self._canonical(table), tag.strip().lower())
-            )
-        return cur.rowcount > 0
+            return conn.execute("DELETE FROM tags WHERE id = ?", (tag_id,)).rowcount > 0
 
     def write_note(self, target: str, body: str, author: str = "user") -> dict:
         """Add a note (Markdown) about a table or one column. Notes are kept, never overwritten."""
@@ -208,7 +220,19 @@ class Catalog:
         if not body or len(body) > MAX_NOTE:
             raise ImportErrorForUser(f"a note has between 1 and {MAX_NOTE} characters")
         where = self._target(target)
+        table = ".".join(where.split(".")[:2])
+        limits = LIMITS[author]
         with closing(self._conn()) as conn, conn:
+            in_table = conn.execute(
+                "SELECT COUNT(*) FROM notes WHERE author = ? AND (target = ? OR substr(target, 1, ?) = ?)",
+                (author, table, len(table) + 1, table + "."),
+            ).fetchone()[0]
+            total = conn.execute("SELECT COUNT(*) FROM notes WHERE author = ?", (author,)).fetchone()[0]
+            if in_table >= limits["notes_per_table"] or total >= limits["notes_total"]:
+                raise ImportErrorForUser(
+                    f"too many notes from {author}: {in_table} on {table} (limit {limits['notes_per_table']}), "
+                    f"{total} in all (limit {limits['notes_total']}). Delete old ones first."
+                )
             cur = conn.execute(
                 "INSERT INTO notes (target, body, author, created_at) VALUES (?, ?, ?, ?)",
                 (where, body, author, _now()),
@@ -222,29 +246,41 @@ class Catalog:
             raise ImportErrorForUser(f"no such note: {note_id}")
         return dict(row)
 
-    def list_notes(self, table: str | None = None) -> list[dict]:
-        """Notes about a table and its columns, oldest first."""
+    def list_notes(self, table: str | None = None, after: int = 0, limit: int = NOTES_PAGE) -> list[dict]:
+        """Notes about a table and its columns, oldest first, one page at a time: pass the last id seen as `after`."""
+        limit = max(1, min(limit, 200))
         with closing(self._conn()) as conn:
             if table is None:
-                rows = conn.execute("SELECT * FROM notes ORDER BY id")
+                rows = conn.execute("SELECT * FROM notes WHERE id > ? ORDER BY id LIMIT ?", (after, limit))
             else:
                 name = self._canonical(table)
-                rows = conn.execute(
-                    "SELECT * FROM notes WHERE target = ? OR target LIKE ? ORDER BY id", (name, name + ".%")
+                rows = conn.execute(  # a literal prefix, not LIKE: '_' and '%' in table names are ordinary characters
+                    "SELECT * FROM notes WHERE id > ? AND (target = ? OR substr(target, 1, ?) = ?) ORDER BY id LIMIT ?",
+                    (after, name, len(name) + 1, name + ".", limit),
                 )
             return [dict(r) for r in rows]
+
+    def count_notes(self, table: str) -> int:
+        name = self._canonical(table)
+        with closing(self._conn()) as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM notes WHERE target = ? OR substr(target, 1, ?) = ?",
+                (name, len(name) + 1, name + "."),
+            ).fetchone()[0]
 
     def delete_note(self, note_id: int) -> bool:
         with closing(self._conn()) as conn, conn:
             return conn.execute("DELETE FROM notes WHERE id = ?", (note_id,)).rowcount > 0
 
-    def table_info(self, name: str) -> dict:
+    def table_info(self, name: str, notes_after: int = 0, notes_limit: int = NOTES_PAGE) -> dict:
         ns, tbl = split_name(name)
         t = self.iceberg.load_table((ns, tbl))
         blockers = self.push_blockers(name)
         return {
-            "tags": [{"tag": t["tag"], "source": t["source"]} for t in self.list_tags(f"{ns}.{tbl}")],
-            "notes": self.list_notes(f"{ns}.{tbl}"),
+            "tags": [{"id": t["id"], "tag": t["tag"], "source": t["source"]} for t in self.list_tags(f"{ns}.{tbl}")],
+            "notes": (page := self.list_notes(f"{ns}.{tbl}", notes_after, notes_limit)),
+            "notes_total": self.count_notes(f"{ns}.{tbl}"),
+            "notes_next": page[-1]["id"] if len(page) == max(1, min(notes_limit, 200)) else None,
             "push_ready": not blockers,
             "push_blockers": blockers,
             "name": f"{ns}.{tbl}",
