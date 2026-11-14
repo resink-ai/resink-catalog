@@ -138,3 +138,63 @@ def read_file(path: Path, fmt: str) -> pa.Table:
     if fmt == "parquet":
         return read_parquet(path)
     raise ReadError(f"unsupported format {fmt!r}")
+
+
+# Column types a user may choose. They are the Iceberg primitives the catalog writes.
+TYPE_NAMES = ("string", "long", "double", "boolean", "date", "timestamp")
+_SQL_TYPE = {
+    "string": "VARCHAR",
+    "long": "BIGINT",
+    "double": "DOUBLE",
+    "boolean": "BOOLEAN",
+    "date": "DATE",
+    "timestamp": "TIMESTAMP",
+}
+
+
+def type_name(t: pa.DataType) -> str:
+    """The user-facing name of an Arrow type."""
+    if pa.types.is_integer(t):
+        return "long"
+    if pa.types.is_floating(t) or pa.types.is_decimal(t):
+        return "double"
+    if pa.types.is_boolean(t):
+        return "boolean"
+    if pa.types.is_date(t):
+        return "date"
+    if pa.types.is_timestamp(t):
+        return "timestamp"
+    if pa.types.is_string(t) or pa.types.is_large_string(t):
+        return "string"
+    return str(t)
+
+
+def apply_types(table: pa.Table, overrides: dict[str, str]) -> pa.Table:
+    """Cast the named columns. A value that cannot be converted fails the whole import with the column named, so a
+    wrong choice is seen, not silently turned into nulls."""
+    if not overrides:
+        return table
+    unknown = [c for c in overrides if c not in table.schema.names]
+    if unknown:
+        raise ReadError(f"no such column: {', '.join(unknown)}")
+    bad = [f"{c}: {t}" for c, t in overrides.items() if t not in TYPE_NAMES]
+    if bad:
+        raise ReadError(f"unknown type ({', '.join(bad)}); choose one of {', '.join(TYPE_NAMES)}")
+    con = duckdb.connect()
+    con.register("_t", table)
+    parts = []
+    for name in table.schema.names:
+        q = '"' + name.replace('"', '""') + '"'
+        want = overrides.get(name)
+        if want is None or type_name(table.schema.field(name).type) == want:
+            parts.append(q)
+        elif want == "double" and pa.types.is_string(table.schema.field(name).type):
+            parts.append(f"CAST(replace({q}, ',', '') AS DOUBLE) AS {q}")  # '1,234.50'
+        else:
+            parts.append(f"CAST({q} AS {_SQL_TYPE[want]}) AS {q}")
+    try:
+        return con.sql(f"SELECT {', '.join(parts)} FROM _t").to_arrow_table()
+    except duckdb.Error as e:
+        raise ReadError(f"cannot convert to the chosen type: {str(e).splitlines()[0]}") from e
+    finally:
+        con.close()

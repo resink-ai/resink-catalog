@@ -56,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("import", "import a file, or apply the proposal for a folder added with add-folder"),
         ("add-folder", "find data files in a folder and propose tables; imports nothing"),
         ("scan", "re-check all sources and folders for changes"),
+        ("preview", "show the inferred column types and sample rows of a file, before importing"),
     ):
         q = sub.add_parser(name, help=help_)
         q.add_argument("--home", type=Path, default=None, help="data directory")
@@ -63,7 +64,14 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "import":
             q.add_argument("path", type=Path, help="a CSV or Parquet file, or a folder added with add-folder")
             q.add_argument("--table", help="target table, 'name' or 'namespace.name' (single file only)")
-        elif name == "add-folder":
+            q.add_argument(
+                "--type",
+                action="append",
+                default=[],
+                metavar="COLUMN=TYPE",
+                help="override an inferred column type (one file): string, long, double, boolean, date, timestamp",
+            )
+        elif name in ("add-folder", "preview"):
             q.add_argument("path", type=Path)
         else:
             q.add_argument("--apply", action="store_true", help="re-import the sources that changed")
@@ -78,6 +86,27 @@ def _print(args, payload, lines) -> None:
             print(line)
 
 
+def _parse_types(pairs: list[str]) -> dict[str, str]:
+    out = {}
+    for pair in pairs:
+        col, sep, typ = pair.rpartition("=")
+        if not sep or not col:
+            raise ImportErrorForUser(f"--type expects COLUMN=TYPE, got {pair!r}")
+        out[col] = typ
+    return out
+
+
+def _preview_lines(view: dict) -> list[str]:
+    lines = [
+        f"{c['name']:24} {c['type']:10}" + (f" (inferred {c['inferred']})" if c["type"] != c["inferred"] else "")
+        for c in view["columns"]
+    ]
+    if view["error"]:
+        lines.append(f"error: {view['error']}")
+    lines += [str(r) for r in view["rows"][:5]]
+    return lines
+
+
 def run_command(args) -> int:
     cat = Catalog(args.home or default_home())
     try:
@@ -90,16 +119,24 @@ def run_command(args) -> int:
                 + [f"{len(found)} files proposed. Nothing imported yet: run `resink-catalog import {args.path}`."],
             )
         elif args.command == "import":
+            types = _parse_types(args.type)
             if args.path.is_dir():
+                if types:
+                    raise ImportErrorForUser("--type applies to one file, not to a folder")
                 results = cat.import_folder(args.path)
             else:
-                results = [cat.import_file(args.path, args.table)]
+                results = [cat.import_file(args.path, args.table, types or None)]
             _print(
                 args,
                 [r.as_dict() for r in results],
                 [f"{r.outcome:9} {r.table:30} {r.path}" + (f"  ({r.error})" if r.error else "") for r in results],
             )
             return 1 if any(r.outcome == "error" for r in results) else 0
+        elif args.command == "preview":
+            p = args.path.expanduser().resolve()
+            view = cat.preview(cat.register_file(p))
+            _print(args, view, _preview_lines(view))
+            return 1 if view["error"] else 0
         elif args.command == "scan":
             report = cat.scan(apply=args.apply)
             _print(args, report, [f"{k}: {len(v)}" for k, v in report.items()])
