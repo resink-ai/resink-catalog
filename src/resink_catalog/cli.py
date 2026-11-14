@@ -54,6 +54,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-browser", action="store_true", help="do not open the browser")
     m = sub.add_parser("mcp", help="MCP server on stdio, for Claude Code, Codex and other MCP clients")
     m.add_argument("--home", type=Path, default=None, help="data directory")
+    k = sub.add_parser("agent-kit", help="install skill files for Claude Code and Codex")
+    ks = k.add_subparsers(dest="kit_command", required=True)
+    ki = ks.add_parser("install", help="copy the skills to where the tools look for them")
+    ki.add_argument(
+        "--claude", nargs="?", const="", metavar="DIR", help="install for Claude Code (default ~/.claude/skills)"
+    )
+    ki.add_argument("--codex", nargs="?", const="", metavar="DIR", help="for Codex (default ~/.codex/prompts)")
+    ks.add_parser("config", help="print the MCP configuration for both tools")
     for name, help_ in (
         ("import", "import a file, or apply the proposal for a folder added with add-folder"),
         ("add-folder", "find data files in a folder and propose tables; imports nothing"),
@@ -150,6 +158,23 @@ def run_command(args) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "agent-kit":
+        from . import agent_kit
+
+        if args.kit_command == "config":
+            print(agent_kit.MCP_CONFIG, end="")
+            return 0
+        if args.claude is None and args.codex is None:
+            print("error: choose --claude and/or --codex", file=sys.stderr)
+            return 2
+        written = []
+        if args.claude is not None:
+            written += agent_kit.install_claude(Path(args.claude) if args.claude else None)
+        if args.codex is not None:
+            written += agent_kit.install_codex(Path(args.codex) if args.codex else None)
+        for p in written:
+            print(p)
+        return 0
     if args.command == "mcp":
         from .mcp_server import build_server
 

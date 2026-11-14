@@ -29,10 +29,11 @@ MAX_QUERY_ROWS = 500
 
 INSTRUCTIONS = (
     "This is the user's local data catalog: their own CSV and Parquet files turned into Iceberg tables. "
-    "Start with list_tables, look at a table with describe_table and sample_table, and use query_sql (read-only SQL, "
-    "tables as namespace.table) to check what you think the data means. Ask the user about anything you cannot tell "
-    "from the data, then record what you learned with write_note (a table or one column) and add_tags. Your notes "
-    "and tags are shown to the user marked as written by ai. You cannot change, import or delete data."
+    "Start with list_tables, look at a table with describe_table and sample_table, and use query_sql (read-only SQL) "
+    "to check what you think the data means. Write tables as namespace.table and quote the namespace 'default' "
+    'because it is an SQL keyword: "default".t, or just t. Ask the user about anything you cannot tell from the '
+    "data, then record what you learned with write_note (a table or one column) and add_tags. Your notes and tags "
+    "are shown to the user marked as written by ai. You cannot change, import or delete data."
 )
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)

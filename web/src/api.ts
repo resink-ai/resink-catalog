@@ -10,7 +10,10 @@ export class ApiError extends Error {
   }
 }
 
-export type TableSummary = { name: string; columns: string[]; snapshots: number; rows: number };
+export type Author = "user" | "ai";
+export type Tag = { tag: string; source: Author };
+export type Note = { id: number; target: string; body: string; author: Author; created_at: string };
+export type TableSummary = { name: string; columns: string[]; snapshots: number; rows: number; tags: Tag[] };
 export type Snapshot = {
   snapshot_id: number;
   timestamp_ms: number;
@@ -21,6 +24,8 @@ export type Snapshot = {
 };
 export type TableInfo = {
   name: string;
+  tags: Tag[];
+  notes: Note[];
   push_ready: boolean;
   push_blockers: string[];
   schema: { name: string; type: string; required: boolean }[];
@@ -79,6 +84,11 @@ export const api = {
   tables: () => call<TableSummary[]>("GET", "/api/v1/tables"),
   table: (name: string) => call<TableInfo>("GET", `/api/v1/tables/${enc(name)}`),
   sample: (name: string) => call<Sample>("GET", `/api/v1/tables/${enc(name)}/sample?limit=20`),
+  addTags: (name: string, tags: string[]) => call<unknown>("POST", `/api/v1/tables/${enc(name)}/tags`, { tags }),
+  removeTag: (name: string, tag: string) => call<unknown>("DELETE", `/api/v1/tables/${enc(name)}/tags/${enc(tag)}`),
+  addNote: (name: string, body: string, target?: string) =>
+    call<Note>("POST", `/api/v1/tables/${enc(name)}/notes`, { body, target }),
+  removeNote: (id: number) => call<unknown>("DELETE", `/api/v1/notes/${id}`),
   roots: () => call<Root[]>("GET", "/api/v1/roots"),
   sources: () => call<Source[]>("GET", "/api/v1/sources"),
   addFolder: (path: string) => call<Source[]>("POST", "/api/v1/roots", { path }),

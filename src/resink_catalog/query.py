@@ -26,7 +26,10 @@ def check_read_only(con: duckdb.DuckDBPyConnection, sql: str) -> None:
     try:
         statements = con.extract_statements(sql)
     except duckdb.Error as e:
-        raise QueryError(f"cannot parse SQL: {str(e).splitlines()[0]}") from e
+        hint = ""
+        if re.search(r"\bdefault\.", sql, re.I):  # the default namespace is an SQL keyword
+            hint = ' (the namespace "default" is an SQL keyword: write "default"."table", or just table)'
+        raise QueryError(f"cannot parse SQL: {str(e).splitlines()[0]}{hint}") from e
     if len(statements) != 1:
         raise QueryError("exactly one statement is allowed")
     if statements[0].type != duckdb.StatementType.SELECT:

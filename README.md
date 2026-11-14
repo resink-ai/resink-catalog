@@ -2,7 +2,7 @@
 
 Local Catalog: turns data files on your computer (CSV, Parquet, exports) into queryable Iceberg tables, and can push them to Resink cloud. Free and open source (Apache-2.0).
 
-**Status: L2 (web UI).** CSV and Parquet files become Iceberg tables; the catalog speaks Iceberg REST; you can query it with read-only SQL, and browse, review and import from a web UI. No MCP or push yet.
+**Status: L3 (MCP and agent kit).** CSV and Parquet files become Iceberg tables; the catalog speaks Iceberg REST; you can query it with read-only SQL, browse, review and import from a web UI, and let your own AI (Claude Code, Codex) look at it over MCP and write notes and tags back. No push yet.
 
 ## Run
 
@@ -31,6 +31,17 @@ Security model:
 Column types can also be set from the command line: `resink-catalog preview sales.csv` shows what was inferred, and `resink-catalog import sales.csv --type id=string --type day=date` overrides it (types: string, long, double, boolean, date, timestamp). The choice is remembered for later imports of that file. A type cannot change on a table that already exists.
 
 From a source checkout the UI has to be built once (Node 20+): `scripts/build_ui.sh`. Released wheels already contain it.
+
+## Let your AI look at your data (MCP)
+
+```bash
+claude mcp add resink-catalog -- resink-catalog mcp      # Claude Code; Codex: see agent_kit/README.md
+resink-catalog agent-kit install --claude --codex        # skills: data-interview, table-tidy-up
+```
+
+Seven tools: `list_tables`, `describe_table`, `sample_table`, `query_sql` (one read-only `SELECT`; everything else is refused), `list_sources`, `add_tags`, `write_note`. The AI cannot import, change or delete anything. Its tags and notes are stored with their author (`ai` or `user`), shown in the web UI under each table's *Notes and tags* tab marked `ai`, and you can delete any of them there. Transports: `resink-catalog mcp` on stdio, and `/mcp` on the local server behind the access token (`Authorization: Bearer <token>`). Tables are `namespace.table`; the namespace `default` is an SQL keyword, so write `"default"."t"` or just `t`.
+
+`scripts/check_claude_code.sh` checks, by hand, that real Claude Code attaches (add `--ask` for a short real conversation). It is not part of the test run.
 
 ## Import your files
 
@@ -75,7 +86,8 @@ uv run pytest -s tests/test_sample_set.py  # prints the import success rate on t
 uv run python tests/samples.py /tmp/sample # writes the 50 sample files, to try add-folder by hand
 scripts/build_ui.sh                        # web: npm ci, Vitest (18 tests), production build into the package
 (cd web && npx playwright test)            # end-to-end smoke test against `serve`, drives the installed Chrome
-scripts/check_wheel.sh                     # builds the wheel and checks that it contains the UI
+scripts/check_wheel.sh                     # builds the wheel and checks that it contains the UI and the agent kit
+RESINK_CATALOG_REAL_DATA=/path/to/sqlite-files uv run pytest -s tests/test_real_data.py   # opt-in, real data
 ```
 
 The Playwright test uses the Chrome already on the machine (`channel: "chrome"`), so nothing is downloaded; use `E2E_CHANNEL=chromium npx playwright install chromium` for a managed browser. It needs no network after `npm ci` (D10).

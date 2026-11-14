@@ -98,3 +98,11 @@ def test_new_routes_need_the_token(home):
         ("post", "/iceberg/v1/namespaces"),
     ]:
         assert getattr(bare, method)(path).status_code == 401, path
+
+
+def test_the_default_namespace_keyword_gets_a_helpful_error(api, home):
+    Catalog(home).write_table("t", pd.DataFrame({"a": [1]}))
+    bad = api.post("/api/v1/query", json={"sql": "select count(*) from default.t"})
+    assert bad.status_code == 400 and 'is an SQL keyword' in bad.json()["detail"]
+    for ok in ('select count(*) from "default"."t"', "select count(*) from t", 'select count(*) from "default".t'):
+        assert api.post("/api/v1/query", json={"sql": ok}).json()["rows"] == [[1]], ok

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { expect, test } from "@playwright/test";
 
 const LINK = "/?token=e2e-token"; // what `serve` prints
@@ -51,6 +52,19 @@ test("a folder of exports becomes tables you can inspect and query, in both them
   await page.getByLabel("SQL query").fill("drop table exports.thousands_a");
   await page.getByRole("button", { name: "Run" }).click();
   await expect(page.getByRole("alert")).toContainText("read-only");
+
+  // L3: an AI writes a tag and a note through the real MCP stdio server; the UI shows them marked ai
+  execFileSync("uv", ["run", "python", "tests/mcp_seed.py", "/tmp/resink-e2e/home", "exports.thousands_a"], { cwd: ".." });
+  await nav.getByRole("link", { name: "Tables" }).click();
+  await page.getByRole("link", { name: /exports\.thousands_a/ }).click();
+  await expect(page.getByRole("list", { name: "Tags" }).locator(".tag.ai").first()).toContainText("finance");
+  await page.getByRole("tab", { name: /Notes and tags/ }).click();
+  const aiNote = page.locator("li.note.ai", { hasText: "one row per invoice line" });
+  await expect(aiNote).toBeVisible();
+  await expect(aiNote.getByLabel("written by ai")).toBeVisible();
+  await page.getByLabel("Note", { exact: true }).fill("Checked against the invoices.");
+  await page.getByRole("button", { name: "Add note" }).click();
+  await expect(page.locator("li.note.user", { hasText: "Checked against" }).getByLabel("written by you")).toBeVisible();
 
   // L2.4 both themes: the page colours really change
   const bg = () => page.evaluate(() => getComputedStyle(document.body).backgroundColor);

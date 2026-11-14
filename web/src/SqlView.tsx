@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 import { api, type QueryResult } from "./api";
 import { DataTable, ErrorNote } from "./components";
 
+/** "default" is an SQL keyword, so every part is quoted. */
+export const quoted = (name: string) => name.split(".").map((p) => `"${p.replace(/"/g, '""')}"`).join(".");
+
 export function SqlView() {
   const [sql, setSql] = useState("");
   const [tables, setTables] = useState<string[]>([]);
@@ -32,7 +35,7 @@ export function SqlView() {
       {tables.length > 0 && (
         <div className="chips" aria-label="Tables">
           {tables.map((t) => (
-            <button key={t} className="chip" onClick={() => setSql(`select * from ${t} limit 20`)}>
+            <button key={t} className="chip" onClick={() => setSql(`select * from ${quoted(t)} limit 20`)}>
               {t}
             </button>
           ))}

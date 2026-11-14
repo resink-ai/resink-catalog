@@ -121,3 +121,14 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .types label > span:first-child { min-width: 7rem; font-weight: 600; overflow-wrap: anywhere; }
 .chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.5rem; }
 .chip { font-size: 0.85rem; padding: 0.15rem 0.6rem; border-radius: 999px; }
+
+.tag-list { list-style: none; display: flex; flex-wrap: wrap; gap: 0.35rem; padding: 0; margin: 0.25rem 0; }
+.tag { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.05rem 0.55rem; border-radius: 999px; border: 1px solid var(--border); background: var(--row); font-size: 0.85rem; }
+.tag.ai { border-color: var(--info); }
+.tag-ai { font-size: 0.7rem; font-weight: 700; color: var(--info); text-transform: uppercase; }
+.tag button { padding: 0 0.3rem; border: 0; }
+.notes { list-style: none; padding: 0; margin: 0 0 1rem; display: grid; gap: 0.6rem; }
+.note { border: 1px solid var(--border); border-left-width: 4px; border-radius: 8px; padding: 0.5rem 0.8rem; background: var(--surface); }
+.note.ai { border-left-color: var(--info); }
+.note.user { border-left-color: var(--ok); }
+.note p { margin: 0.25rem 0 0; white-space: pre-wrap; }
