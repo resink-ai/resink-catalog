@@ -9,7 +9,31 @@ from contextlib import closing
 from pathlib import Path
 
 HOME_ENV = "RESINK_CATALOG_HOME"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+
+# Our own tables (design section 5). Iceberg metadata lives in PyIceberg's SQL catalog tables in the same file.
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS data_roots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    last_scan TEXT
+);
+CREATE TABLE IF NOT EXISTS data_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_id INTEGER REFERENCES data_roots(id),
+    path TEXT NOT NULL UNIQUE,
+    format TEXT NOT NULL,
+    content_hash TEXT,
+    target_table TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'overwrite',
+    last_import TEXT,
+    status TEXT NOT NULL,
+    error TEXT,
+    rows INTEGER
+);
+"""
 
 
 def default_home() -> Path:
@@ -43,8 +67,10 @@ def init_db(home: Path) -> Path:
     db_path = home / "catalog.db"
     with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.executescript(SCHEMA_SQL)
         conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (str(SCHEMA_VERSION),),
         )
     return db_path
