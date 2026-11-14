@@ -291,6 +291,15 @@ paths:
         went stale, the commit stops after the snapshot in flight and the session ends `failed` with
         `committed_through` set to the last source snapshot that is committed. The client starts a new push to resume.
         A session of another device, or an unknown `push_id`, answers `404 not_found`.
+
+        If the session's `admission.outcome` is `over_included`, the body must carry `confirm_over_included: true`.
+        Without it the commit is refused with `409 confirmation_required`, whose detail names the estimated monthly
+        cost, so a buggy or old client can never incur charges silently. The body is optional otherwise.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CommitRequest'}
       responses:
         '200':
           description: Already committed; the result.
@@ -305,7 +314,14 @@ paths:
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
-        '409': {$ref: '#/components/responses/Problem'}
+        '409':
+          description: >-
+            `confirmation_required` (the session was accepted as `over_included` and the request lacks
+            `confirm_over_included: true`; carries `estimated_extra_monthly_cost`), or a state conflict such as
+            `history_diverged`.
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
         '410': {$ref: '#/components/responses/Problem'}
         '413':
           description: The re-check at commit found a ceiling exceeded (it was lowered meanwhile). Code `storage_ceiling`.
@@ -393,6 +409,7 @@ components:
         - forbidden
         - storage_ceiling
         - staging_full
+        - confirmation_required
         - not_found
         - push_in_progress
         - offset_mismatch
@@ -421,6 +438,8 @@ components:
         push_id: {type: string, description: 'Set on push_in_progress.'}
         received_bytes: {type: integer, format: int64, description: 'Set on offset_mismatch.'}
         feature: {type: string, description: 'Set on unsupported_table_feature.'}
+        estimated_extra_monthly_cost:
+          $ref: '#/components/schemas/Money'
         pause_reason: {type: string, enum: [billing, admin], description: 'Set on workspace_paused.'}
         resolution:
           type: array
@@ -549,6 +568,13 @@ components:
         removed_file_ids:
           type: array
           items: {$ref: '#/components/schemas/FileId'}
+    CommitRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        confirm_over_included:
+          type: boolean
+          description: Required to be true when the session's admission outcome is `over_included`. The user confirmed the extra monthly cost.
     IcebergSchema:
       type: object
       additionalProperties: false

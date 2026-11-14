@@ -24,6 +24,7 @@ DOC_ERRORS = {
         "history_diverged",
         "schema_conflict",
         "table_exists",
+        "confirmation_required",  # added after the design text: commit of an over_included session without confirmation
     },
     410: {"session_expired"},
     413: {"file_too_large", "storage_ceiling"},
@@ -237,3 +238,15 @@ def test_admission_replaces_quota_in_the_session(spec):
     ceiling = resolve(spec, spec["components"]["schemas"]["StorageCeilingProblem"])["allOf"][1]
     assert {"ceiling_bytes", "used_bytes", "reserved_bytes", "incoming_bytes"} <= set(ceiling["properties"])
     assert "committed_through" in session["properties"]
+
+
+def test_commit_of_an_over_included_session_needs_confirmation(spec):
+    commit = spec["paths"]["/push/v0/pushes/{push_id}/commit"]["post"]
+    assert "confirm_over_included" in commit["description"] and "confirmation_required" in commit["description"]
+    assert "409" in commit["responses"] and "confirmation_required" in commit["responses"]["409"]["description"]
+    body = commit["requestBody"]["content"]["application/json"]["schema"]
+    v = validator(spec, body["$ref"].rsplit("/", 1)[-1])
+    assert list(v.iter_errors({})) == [] and list(v.iter_errors({"confirm_over_included": True})) == []
+    assert list(v.iter_errors({"confirm_over_included": "yes"})) and list(v.iter_errors({"confirm": True}))
+    problem = spec["components"]["schemas"]["Problem"]["properties"]
+    assert "estimated_extra_monthly_cost" in problem  # the refusal names the cost
