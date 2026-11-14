@@ -130,7 +130,7 @@ def test_old_catalog_without_column_types_is_upgraded(tmp_path):
         "CREATE TABLE data_sources (id INTEGER PRIMARY KEY AUTOINCREMENT, root_id INTEGER, path TEXT NOT NULL UNIQUE,"
         " format TEXT NOT NULL, content_hash TEXT, target_table TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'overwrite',"
         " last_import TEXT, status TEXT NOT NULL, error TEXT, rows INTEGER);"
-        "INSERT INTO data_sources (path, format, target_table, status) VALUES ('/x.csv', 'csv', 'default.x', 'proposed');"
+        "INSERT INTO data_sources (path, format, target_table, status) VALUES ('/x.csv', 'csv', 'main.x', 'proposed');"
     )
     conn.commit()
     conn.close()

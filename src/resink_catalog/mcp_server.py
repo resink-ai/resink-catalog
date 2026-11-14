@@ -30,8 +30,8 @@ MAX_QUERY_ROWS = 500
 INSTRUCTIONS = (
     "This is the user's local data catalog: their own CSV and Parquet files turned into Iceberg tables. "
     "Start with list_tables, look at a table with describe_table and sample_table, and use query_sql (read-only SQL) "
-    "to check what you think the data means. Write tables as namespace.table and quote the namespace 'default' "
-    'because it is an SQL keyword: "default".t, or just t. Ask the user about anything you cannot tell from the '
+    "to check what you think the data means. Write tables as namespace.table (single files go to "
+    "the namespace main, so main.t, or just t). Ask the user about anything you cannot tell from the "
     "data, then record what you learned with write_note (a table or one column) and add_tags. Your notes and tags "
     "are shown to the user marked as written by ai. You cannot change, import or delete data."
 )
@@ -60,7 +60,7 @@ def build_server(get_catalog: Callable[[], Catalog]) -> MCPServer:
 
     @mcp.tool(annotations=READ_ONLY)
     def describe_table(
-        table: Annotated[str, Field(description="'namespace.table' (or 'table': default namespace)")],
+        table: Annotated[str, Field(description="'namespace.table' (or 'table': the main namespace)")],
     ) -> dict:
         """Schema, snapshot history, tags, notes (each marked user or ai), whether it can be pushed to the cloud,
         and the source files it was imported from."""

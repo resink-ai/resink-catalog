@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import warnings
@@ -21,6 +22,8 @@ from .home import default_home, ensure_home, init_db
 from .query import query_arrow, run_query
 from .readers import ReadError, apply_types, detect_format, file_hash, read_file, type_name
 from .store import DEFAULT_NAMESPACE, open_iceberg, slug, split_name
+
+log = logging.getLogger(__name__)
 
 SOURCE_COLUMN = "_source_file"  # present in tables built from several export files of one source
 SOURCE_FIELDS = (
@@ -64,6 +67,32 @@ class Catalog:
         self.home = ensure_home(Path(home) if home else default_home())
         self.db_path = init_db(self.home)
         self.iceberg = open_iceberg(self.home)
+        self.migrated = self._migrate_default_namespace()
+
+    def _migrate_default_namespace(self) -> list[str]:
+        """Catalogs made before the rename have their tables in `default`: move them to `main` (nothing is released
+        yet, but a developer's catalog should keep working). Returns the moved table names; logs what it did."""
+        old, new = "default", DEFAULT_NAMESPACE
+        if (old,) not in self.iceberg.list_namespaces() or (new,) in self.iceberg.list_namespaces():
+            return []
+        self._ensure_namespace(new)
+        moved = []
+        for _, name in self.iceberg.list_tables(old):
+            self.iceberg.rename_table((old, name), (new, name))  # the catalog row moves; data files stay in place
+            moved.append(f"{new}.{name}")
+        if not self.iceberg.list_tables(old):
+            self.iceberg.drop_namespace(old)
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            for m in moved:
+                o = f"{old}.{m.split('.', 1)[1]}"
+                conn.execute("UPDATE data_sources SET target_table = ? WHERE target_table = ?", (m, o))
+                conn.execute("UPDATE tags SET table_name = ? WHERE table_name = ?", (m, o))
+                conn.execute("UPDATE notes SET target = ? WHERE target = ?", (m, o))
+                conn.execute(
+                    "UPDATE notes SET target = ? || substr(target, ?) WHERE target LIKE ?", (m, len(o) + 1, o + ".%")
+                )
+        log.info("moved %d table(s) from namespace %r to %r: %s", len(moved), old, new, ", ".join(moved))
+        return moved
 
     # ------------------------------------------------------------------ tables
 
@@ -112,7 +141,7 @@ class Catalog:
     # -------------------------------------------------------------- tags and notes (design section 5)
 
     def _canonical(self, name: str) -> str:
-        """'t' -> 'default.t'; raises when the table does not exist, so annotations never point at nothing."""
+        """'t' -> 'main.t'; raises when the table does not exist, so annotations never point at nothing."""
         ns, tbl = split_name(name)
         try:
             self.iceberg.load_table((ns, tbl))
@@ -415,7 +444,7 @@ class Catalog:
     def import_file(
         self, path: Path | str, table: str | None = None, column_types: dict[str, str] | None = None
     ) -> ImportResult:
-        """Import one file now. Without `table` it goes to default.<file name>. `column_types` overrides the
+        """Import one file now. Without `table` it goes to main.<file name>. `column_types` overrides the
         inferred types (and is remembered for later imports of the same file)."""
         source_id = self.register_file(path, table)
         if column_types is not None:

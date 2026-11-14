@@ -137,11 +137,11 @@ async def test_bad_arguments_are_tool_errors_the_ai_can_read(mcp, tool, args):
 async def test_list_sources(mcp, cat, tmp_path):
     f = tmp_path / "a.csv"
     f.write_text("x\n1\n")
-    cat.import_file(f, "default.a")
+    cat.import_file(f, "main.a")
     [s] = data(await mcp.call_tool("list_sources", {}))
-    assert (s["target_table"], s["status"], s["rows"]) == ("default.a", "imported", 1)
+    assert (s["target_table"], s["status"], s["rows"]) == ("main.a", "imported", 1)
     assert data(await mcp.call_tool("list_sources", {"status": "error"})) == []
-    d = data(await mcp.call_tool("describe_table", {"table": "default.a"}))
+    d = data(await mcp.call_tool("describe_table", {"table": "main.a"}))
     assert d["sources"][0]["path"] == str(f.resolve())
 
 

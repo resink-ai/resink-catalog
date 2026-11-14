@@ -39,7 +39,7 @@ claude mcp add resink-catalog -- resink-catalog mcp      # Claude Code; Codex: s
 resink-catalog agent-kit install --claude --codex        # skills: data-interview, table-tidy-up
 ```
 
-Seven tools: `list_tables`, `describe_table`, `sample_table`, `query_sql` (one read-only `SELECT`; everything else is refused), `list_sources`, `add_tags`, `write_note`. The AI cannot import, change or delete anything. Its tags and notes are stored with their author (`ai` or `user`), shown in the web UI under each table's *Notes and tags* tab marked `ai`, and you can delete any of them there. Transports: `resink-catalog mcp` on stdio, and `/mcp` on the local server behind the access token (`Authorization: Bearer <token>`). Tables are `namespace.table`; the namespace `default` is an SQL keyword, so write `"default"."t"` or just `t`.
+Seven tools: `list_tables`, `describe_table`, `sample_table`, `query_sql` (one read-only `SELECT`; everything else is refused), `list_sources`, `add_tags`, `write_note`. The AI cannot import, change or delete anything. Its tags and notes are stored with their author (`ai` or `user`), shown in the web UI under each table's *Notes and tags* tab marked `ai`, and you can delete any of them there. Transports: `resink-catalog mcp` on stdio, and `/mcp` on the local server behind the access token (`Authorization: Bearer <token>`). Tables are `namespace.table`; single-file imports go to the namespace `main`, so `main.t` or just `t`.
 
 `scripts/check_claude_code.sh` checks, by hand, that real Claude Code attaches (add `--ask` for a short real conversation). It is not part of the test run.
 

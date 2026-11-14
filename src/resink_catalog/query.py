@@ -26,10 +26,7 @@ def check_read_only(con: duckdb.DuckDBPyConnection, sql: str) -> None:
     try:
         statements = con.extract_statements(sql)
     except duckdb.Error as e:
-        hint = ""
-        if re.search(r"\bdefault\.", sql, re.I):  # the default namespace is an SQL keyword
-            hint = ' (the namespace "default" is an SQL keyword: write "default"."table", or just table)'
-        raise QueryError(f"cannot parse SQL: {str(e).splitlines()[0]}{hint}") from e
+        raise QueryError(f"cannot parse SQL: {str(e).splitlines()[0]}") from e
     if len(statements) != 1:
         raise QueryError("exactly one statement is allowed")
     if statements[0].type != duckdb.StatementType.SELECT:
@@ -56,8 +53,6 @@ def query_arrow(catalog: IcebergCatalog, sql: str, limit: int | None = None) -> 
             con.register(f"_src{i}", catalog.load_table(ident).scan().to_arrow())
             con.execute(f'CREATE SCHEMA IF NOT EXISTS "{ns}"')
             con.execute(f'CREATE VIEW "{ns}"."{name}" AS SELECT * FROM _src{i}')
-            if ns == "default":
-                con.execute(f'CREATE VIEW main."{name}" AS SELECT * FROM _src{i}')
         text = sql.strip().rstrip(";")
         if limit is not None:
             text = f"SELECT * FROM ({text}) AS _q LIMIT {int(limit)}"

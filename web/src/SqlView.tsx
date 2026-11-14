@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api, type QueryResult } from "./api";
 import { DataTable, ErrorNote } from "./components";
 
-/** "default" is an SQL keyword, so every part is quoted. */
+/** Every part is quoted so unusual names still parse. */
 export const quoted = (name: string) => name.split(".").map((p) => `"${p.replace(/"/g, '""')}"`).join(".");
 
 export function SqlView() {

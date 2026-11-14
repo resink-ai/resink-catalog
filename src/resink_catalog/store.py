@@ -8,7 +8,7 @@ from pathlib import Path
 from pyiceberg.catalog import Catalog as IcebergCatalog
 from pyiceberg.catalog.sql import SqlCatalog
 
-DEFAULT_NAMESPACE = "default"
+DEFAULT_NAMESPACE = "main"  # DuckDB's own default schema; "default" is an SQL keyword and cannot be written bare
 
 
 def open_iceberg(home: Path) -> IcebergCatalog:
@@ -22,7 +22,7 @@ def open_iceberg(home: Path) -> IcebergCatalog:
 
 
 def split_name(name: str) -> tuple[str, str]:
-    """'sales.monthly' -> ('sales', 'monthly'); 'monthly' -> ('default', 'monthly')."""
+    """'sales.monthly' -> ('sales', 'monthly'); 'monthly' -> ('main', 'monthly')."""
     parts = name.split(".")
     if len(parts) == 1:
         return DEFAULT_NAMESPACE, parts[0]
