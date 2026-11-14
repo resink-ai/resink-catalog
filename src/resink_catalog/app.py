@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import secrets
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -14,6 +16,7 @@ from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError
 from . import __version__
 from .catalog import Catalog, ImportErrorForUser
 from .iceberg_rest import build_router
+from .mcp_server import build_server
 from .query import QueryError
 
 PUBLIC_PATHS = frozenset({"/healthz"})
@@ -61,6 +64,15 @@ class ImportBody(BaseModel):
     column_types: dict[str, str] | None = None  # override inferred types (file or source_id only)
 
 
+class TagsBody(BaseModel):
+    tags: list[str]
+
+
+class NoteBody(BaseModel):
+    target: str | None = None  # the table itself, or 'ns.table.column'; defaults to the table in the URL
+    body: str
+
+
 class TypesBody(BaseModel):
     column_types: dict[str, str]
 
@@ -70,7 +82,14 @@ class ScanBody(BaseModel):
 
 
 def create_app(token: str, home: Path | str | None = None) -> FastAPI:
-    app = FastAPI(title="Resink Local Catalog", version=__version__, docs_url=None, redoc_url=None)
+    mcp_app = None  # built below, after `catalog` exists; its session manager must run inside our lifespan
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        async with mcp_app.router.lifespan_context(mcp_app):
+            yield
+
+    app = FastAPI(title="Resink Local Catalog", version=__version__, docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.catalog = None
 
     def catalog() -> Catalog:
@@ -78,8 +97,12 @@ def create_app(token: str, home: Path | str | None = None) -> FastAPI:
             app.state.catalog = Catalog(home)
         return app.state.catalog
 
+    mcp_app = build_server(catalog).streamable_http_app(streamable_http_path="/")
+
     @app.middleware("http")
     async def require_token(request: Request, call_next):
+        if request.scope["path"] == "/mcp":
+            request.scope["path"] = "/mcp/"  # the MCP app is mounted at /mcp; do not bounce POSTs through a redirect
         # Applies to every path, including ones that do not exist, so probing reveals nothing.
         host = request.headers.get("host", "").rsplit(":", 1)[0]
         if host not in LOOPBACK_HOSTS:  # blocks DNS rebinding
@@ -111,6 +134,7 @@ def create_app(token: str, home: Path | str | None = None) -> FastAPI:
         return {"name": "resink-catalog", "version": __version__}
 
     app.include_router(build_router(lambda: catalog().iceberg))
+    app.mount("/mcp", mcp_app)  # MCP over HTTP, behind the same token as every other route
 
     @app.exception_handler(ImportErrorForUser)
     def _user_error(request: Request, exc: ImportErrorForUser):
@@ -145,6 +169,26 @@ def create_app(token: str, home: Path | str | None = None) -> FastAPI:
     @app.get("/api/v1/sources")
     def sources(status: str | None = None) -> list[dict]:
         return catalog().sources(status)
+
+    @app.post("/api/v1/tables/{name}/tags")
+    def add_tags(name: str, body: TagsBody) -> list[dict]:
+        return catalog().add_tags(name, body.tags, source="user")
+
+    @app.delete("/api/v1/tables/{name}/tags/{tag}")
+    def remove_tag(name: str, tag: str) -> dict:
+        if not catalog().remove_tag(name, tag):
+            raise HTTPException(404, f"no such tag: {tag}")
+        return {"removed": tag}
+
+    @app.post("/api/v1/tables/{name}/notes")
+    def add_note(name: str, body: NoteBody) -> dict:
+        return catalog().write_note(body.target or name, body.body, author="user")
+
+    @app.delete("/api/v1/notes/{note_id}")
+    def delete_note(note_id: int) -> dict:
+        if not catalog().delete_note(note_id):
+            raise HTTPException(404, f"no such note: {note_id}")
+        return {"removed": note_id}
 
     @app.get("/api/v1/roots")
     def roots() -> list[dict]:

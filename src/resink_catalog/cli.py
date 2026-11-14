@@ -52,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help="0 picks a free port")
     p.add_argument("--home", type=Path, default=None, help="data directory")
     p.add_argument("--no-browser", action="store_true", help="do not open the browser")
+    m = sub.add_parser("mcp", help="MCP server on stdio, for Claude Code, Codex and other MCP clients")
+    m.add_argument("--home", type=Path, default=None, help="data directory")
     for name, help_ in (
         ("import", "import a file, or apply the proposal for a folder added with add-folder"),
         ("add-folder", "find data files in a folder and propose tables; imports nothing"),
@@ -148,6 +150,12 @@ def run_command(args) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "mcp":
+        from .mcp_server import build_server
+
+        cat = Catalog(args.home or default_home())
+        build_server(lambda: cat).run("stdio")  # stdout carries the protocol: nothing else may print to it
+        return 0
     if args.command == "serve":
         serve(args.home or default_home(), args.port, not args.no_browser)
         return 0

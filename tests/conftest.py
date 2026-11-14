@@ -51,3 +51,8 @@ def live_server(home):
     yield LiveServer(f"http://127.0.0.1:{port}", TOKEN, home)
     server.should_exit = True
     thread.join(timeout=10)
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"

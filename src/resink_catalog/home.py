@@ -9,7 +9,7 @@ from contextlib import closing
 from pathlib import Path
 
 HOME_ENV = "RESINK_CATALOG_HOME"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 # Our own tables (design section 5). Iceberg metadata lives in PyIceberg's SQL catalog tables in the same file.
@@ -33,6 +33,21 @@ CREATE TABLE IF NOT EXISTS data_sources (
     error TEXT,
     rows INTEGER,
     column_types TEXT
+);
+CREATE TABLE IF NOT EXISTS tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    table_name TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('user', 'ai')),
+    created_at TEXT NOT NULL,
+    UNIQUE (table_name, tag)
+);
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target TEXT NOT NULL,
+    body TEXT NOT NULL,
+    author TEXT NOT NULL CHECK (author IN ('user', 'ai')),
+    created_at TEXT NOT NULL
 );
 """
 

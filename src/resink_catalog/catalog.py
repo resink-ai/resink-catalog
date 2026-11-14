@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
-from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
+from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchNamespaceError, NoSuchTableError
 from pyiceberg.expressions import EqualTo
 
 from .home import default_home, ensure_home, init_db
@@ -27,6 +27,10 @@ SOURCE_FIELDS = (
     "id root_id path format content_hash target_table mode last_import status error rows column_types".split()
 )
 DATE_PARTS = re.compile(r"(\d{4}[-_]?\d{2}[-_]?\d{2}|\d{8}|\d{4}[-_]\d{2}|\d+)")
+
+
+SOURCES_OF_TEXT = ("user", "ai")  # who wrote a tag or note
+MAX_TAG, MAX_TAGS_PER_CALL, MAX_NOTE = 64, 20, 5000
 
 
 class ImportErrorForUser(Exception):
@@ -70,6 +74,9 @@ class Catalog:
             pass
 
     def list_tables(self) -> list[dict]:
+        tags: dict[str, list[dict]] = defaultdict(list)
+        for t in self.list_tags():
+            tags[t["table"]].append({"tag": t["tag"], "source": t["source"]})
         out = []
         for ns in self.iceberg.list_namespaces():
             for ident in self.iceberg.list_tables(ns):
@@ -82,6 +89,7 @@ class Catalog:
                         "snapshots": len(t.metadata.snapshots),
                         "current_snapshot_id": snap.snapshot_id if snap else None,
                         "rows": int(snap.summary["total-records"]) if snap and snap.summary else 0,
+                        "tags": tags.get(".".join(ident), []),
                     }
                 )
         return sorted(out, key=lambda d: d["name"])
@@ -101,11 +109,113 @@ class Catalog:
             blockers.append(f"format version {t.metadata.format_version}")
         return blockers
 
+    # -------------------------------------------------------------- tags and notes (design section 5)
+
+    def _canonical(self, name: str) -> str:
+        """'t' -> 'default.t'; raises when the table does not exist, so annotations never point at nothing."""
+        ns, tbl = split_name(name)
+        try:
+            self.iceberg.load_table((ns, tbl))
+        except (NoSuchTableError, NoSuchNamespaceError):
+            raise ImportErrorForUser(f"no such table: {ns}.{tbl}") from None
+        return f"{ns}.{tbl}"
+
+    def _target(self, target: str) -> str:
+        """A note is about a table ('shop.orders') or one of its columns ('shop.orders.amount')."""
+        parts = target.split(".")
+        if len(parts) >= 3:
+            table, column = ".".join(parts[:2]), ".".join(parts[2:])
+        elif len(parts) == 2 and not self._exists(target):
+            raise ImportErrorForUser(f"no such table: {target}")
+        else:
+            table, column = target, None
+        canonical = self._canonical(table)
+        if column is not None:
+            names = [f.name for f in self.iceberg.load_table(split_name(canonical)).schema().fields]
+            if column not in names:
+                raise ImportErrorForUser(f"table {canonical} has no column {column!r}")
+            return f"{canonical}.{column}"
+        return canonical
+
+    def add_tags(self, table: str, tags: list[str], source: str = "user") -> list[dict]:
+        """Add tags to a table (existing ones are kept; a tag keeps the source that first wrote it)."""
+        if source not in SOURCES_OF_TEXT:
+            raise ValueError("source must be 'user' or 'ai'")
+        cleaned = list(dict.fromkeys(t.strip().lower() for t in tags if t and t.strip()))
+        if not cleaned or len(cleaned) > MAX_TAGS_PER_CALL:
+            raise ImportErrorForUser(f"give between 1 and {MAX_TAGS_PER_CALL} tags")
+        if any(len(t) > MAX_TAG or any(c in t for c in "\n\r\t") for t in cleaned):
+            raise ImportErrorForUser(f"a tag is at most {MAX_TAG} characters on one line")
+        name = self._canonical(table)
+        with closing(self._conn()) as conn, conn:
+            for tag in cleaned:
+                conn.execute(
+                    "INSERT OR IGNORE INTO tags (table_name, tag, source, created_at) VALUES (?, ?, ?, ?)",
+                    (name, tag, source, _now()),
+                )
+        return self.list_tags(name)
+
+    def list_tags(self, table: str | None = None) -> list[dict]:
+        with closing(self._conn()) as conn:
+            q = 'SELECT id, table_name AS "table", tag, source, created_at FROM tags'
+            args: tuple = ()
+            if table is not None:
+                q += " WHERE table_name = ?"
+                args = (self._canonical(table),)
+            return [dict(r) for r in conn.execute(q + " ORDER BY table_name, tag", args)]
+
+    def remove_tag(self, table: str, tag: str) -> bool:
+        with closing(self._conn()) as conn, conn:
+            cur = conn.execute(
+                "DELETE FROM tags WHERE table_name = ? AND tag = ?", (self._canonical(table), tag.strip().lower())
+            )
+        return cur.rowcount > 0
+
+    def write_note(self, target: str, body: str, author: str = "user") -> dict:
+        """Add a note (Markdown) about a table or one column. Notes are kept, never overwritten."""
+        if author not in SOURCES_OF_TEXT:
+            raise ValueError("author must be 'user' or 'ai'")
+        body = body.strip()
+        if not body or len(body) > MAX_NOTE:
+            raise ImportErrorForUser(f"a note has between 1 and {MAX_NOTE} characters")
+        where = self._target(target)
+        with closing(self._conn()) as conn, conn:
+            cur = conn.execute(
+                "INSERT INTO notes (target, body, author, created_at) VALUES (?, ?, ?, ?)",
+                (where, body, author, _now()),
+            )
+        return self.get_note(cur.lastrowid)
+
+    def get_note(self, note_id: int) -> dict:
+        with closing(self._conn()) as conn:
+            row = conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
+        if row is None:
+            raise ImportErrorForUser(f"no such note: {note_id}")
+        return dict(row)
+
+    def list_notes(self, table: str | None = None) -> list[dict]:
+        """Notes about a table and its columns, oldest first."""
+        with closing(self._conn()) as conn:
+            if table is None:
+                rows = conn.execute("SELECT * FROM notes ORDER BY id")
+            else:
+                name = self._canonical(table)
+                rows = conn.execute(
+                    "SELECT * FROM notes WHERE target = ? OR target LIKE ? ORDER BY id", (name, name + ".%")
+                )
+            return [dict(r) for r in rows]
+
+    def delete_note(self, note_id: int) -> bool:
+        with closing(self._conn()) as conn, conn:
+            return conn.execute("DELETE FROM notes WHERE id = ?", (note_id,)).rowcount > 0
+
     def table_info(self, name: str) -> dict:
         ns, tbl = split_name(name)
         t = self.iceberg.load_table((ns, tbl))
         blockers = self.push_blockers(name)
         return {
+            "tags": [{"tag": t["tag"], "source": t["source"]} for t in self.list_tags(f"{ns}.{tbl}")],
+            "notes": self.list_notes(f"{ns}.{tbl}"),
             "push_ready": not blockers,
             "push_blockers": blockers,
             "name": f"{ns}.{tbl}",
