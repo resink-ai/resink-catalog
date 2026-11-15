@@ -45,7 +45,16 @@ def _mentioned(catalog: IcebergCatalog, sql: str) -> list[tuple[str, str]]:
 
 def query_arrow(catalog: IcebergCatalog, sql: str, limit: int | None = None) -> pa.Table:
     """Run a read-only query; `limit` (if given) is pushed into the SQL."""
-    con = duckdb.connect(config={"enable_external_access": False})
+    # No file, network or extension access, whatever the SQL says: external access off, extensions neither
+    # auto-installed nor auto-loaded, and the settings locked so a statement cannot switch them back on.
+    con = duckdb.connect(
+        config={
+            "enable_external_access": False,
+            "autoinstall_known_extensions": False,
+            "autoload_known_extensions": False,
+        }
+    )
+    con.execute("SET lock_configuration = true")
     try:
         check_read_only(con, sql)
         for i, ident in enumerate(_mentioned(catalog, sql)):
@@ -53,8 +62,6 @@ def query_arrow(catalog: IcebergCatalog, sql: str, limit: int | None = None) -> 
             con.register(f"_src{i}", catalog.load_table(ident).scan().to_arrow())
             con.execute(f'CREATE SCHEMA IF NOT EXISTS "{ns}"')
             con.execute(f'CREATE VIEW "{ns}"."{name}" AS SELECT * FROM _src{i}')
-            if ns == "default":
-                con.execute(f'CREATE VIEW main."{name}" AS SELECT * FROM _src{i}')
         text = sql.strip().rstrip(";")
         if limit is not None:
             text = f"SELECT * FROM ({text}) AS _q LIMIT {int(limit)}"

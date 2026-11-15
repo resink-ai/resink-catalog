@@ -22,6 +22,10 @@ afterEach(() => vi.unstubAllGlobals());
 const info = {
   name: "shop.orders",
   push_ready: true,
+  tags: [],
+  notes_total: 0,
+  notes_next: null,
+  notes: [],
   push_blockers: [],
   location: "x",
   schema: [
@@ -57,7 +61,7 @@ test("a table that cannot be pushed says why", async () => {
 
 test("SQL view runs a query with the button and with Ctrl+Enter, and shows errors", async () => {
   const f = routes({
-    "GET /api/v1/tables": [{ name: "shop.orders", columns: [], snapshots: 1, rows: 4 }],
+    "GET /api/v1/tables": [{ name: "shop.orders", columns: [], snapshots: 1, rows: 4, tags: [] }],
     "POST /api/v1/query": (_u: string, init?: RequestInit) =>
       JSON.parse(String(init?.body)).sql.includes("bad")
         ? undefined
@@ -65,7 +69,7 @@ test("SQL view runs a query with the button and with Ctrl+Enter, and shows error
   });
   render(<SqlView />);
   await userEvent.click(await screen.findByRole("button", { name: "shop.orders" }));
-  expect(screen.getByLabelText("SQL query")).toHaveValue("select * from shop.orders limit 20");
+  expect(screen.getByLabelText("SQL query")).toHaveValue('select * from "shop"."orders" limit 20');
   await userEvent.click(screen.getByRole("button", { name: "Run" }));
   expect(await screen.findByRole("cell", { name: "4" })).toBeInTheDocument();
   await userEvent.clear(screen.getByLabelText("SQL query"));
@@ -143,4 +147,79 @@ test("navigation links switch between the three sections", async () => {
   expect(await screen.findByRole("heading", { name: "Folders" })).toBeInTheDocument();
   await userEvent.click(screen.getByRole("link", { name: "SQL" }));
   expect(await screen.findByRole("heading", { name: "SQL" })).toBeInTheDocument();
+});
+
+test("what the AI wrote is marked ai, what the user wrote is marked you", async () => {
+  routes({
+    "GET /api/v1/tables/shop.orders": {
+      ...info,
+      tags: [
+        { id: 1, tag: "sales", source: "ai" },
+        { id: 2, tag: "finance", source: "user" },
+      ],
+      notes_total: 2,
+      notes: [
+        { id: 1, target: "shop.orders", body: "One row per order.", author: "ai", created_at: "2026-11-14T10:00:00+00:00" },
+        { id: 2, target: "shop.orders.id", body: "Order number.", author: "user", created_at: "2026-11-14T11:00:00+00:00" },
+      ],
+    },
+  });
+  render(<TableDetail name="shop.orders" />);
+  await userEvent.click(await screen.findByRole("tab", { name: /Notes and tags \(4\)/ }));
+  const ai = screen.getByText("One row per order.").closest("li")!;
+  expect(ai).toHaveClass("ai");
+  expect(ai.querySelector('[aria-label="written by ai"]')).not.toBeNull();
+  const mine = screen.getByText("Order number.").closest("li")!;
+  expect(mine).toHaveClass("user");
+  expect(mine.querySelector('[aria-label="written by you"]')).not.toBeNull();
+  expect(mine).toHaveTextContent("id"); // the column the note is about
+  const tags = screen.getByRole("list", { name: "Tags (editable)" });
+  expect(tags.querySelector(".tag.ai")).toHaveTextContent("sales");
+  expect(tags.querySelector(".tag.user")).toHaveTextContent("finance");
+});
+
+test("adding a note and a tag, and deleting a note, call the API and reload", async () => {
+  let notes: unknown[] = [];
+  const f = routes({
+    "GET /api/v1/tables/shop.orders": () => ({ ...info, tags: [], notes, notes_total: notes.length }),
+    "POST /api/v1/tables/shop.orders/notes": (_u: string, init?: RequestInit) => {
+      notes = [{ id: 9, target: JSON.parse(String(init?.body)).target, body: JSON.parse(String(init?.body)).body, author: "user", created_at: "2026-11-14T10:00:00+00:00" }];
+      return notes[0];
+    },
+    "POST /api/v1/tables/shop.orders/tags": [],
+    "DELETE /api/v1/notes/9": () => {
+      notes = [];
+      return { removed: 9 };
+    },
+  });
+  render(<TableDetail name="shop.orders" />);
+  await userEvent.click(await screen.findByRole("tab", { name: /Notes and tags/ }));
+  await userEvent.selectOptions(screen.getByLabelText("About"), "shop.orders.id");
+  await userEvent.type(screen.getByLabelText("Note"), "Order number");
+  await userEvent.click(screen.getByRole("button", { name: "Add note" }));
+  expect(await screen.findByText("Order number")).toBeInTheDocument();
+  const post = f.mock.calls.find((c) => String(c[0]).endsWith("/notes"))!;
+  expect(JSON.parse(String((post[1] as RequestInit).body))).toEqual({ body: "Order number", target: "shop.orders.id" });
+  await userEvent.type(screen.getByLabelText("Add tags (comma separated)"), "sales, finance");
+  await userEvent.click(screen.getByRole("button", { name: "Add" }));
+  await waitFor(() => expect(f.mock.calls.some((c) => String(c[0]).endsWith("/tags"))).toBe(true));
+  await userEvent.click(screen.getByRole("button", { name: "Delete note 9" }));
+  expect(await screen.findByText("No notes yet.")).toBeInTheDocument();
+});
+
+test("long note lists come a page at a time, with a button for the next page", async () => {
+  const note = (id: number) => ({ id, target: "shop.orders", body: `note ${id}`, author: "ai", created_at: "2026-11-14T10:00:00+00:00" });
+  const f = routes({
+    "GET /api/v1/tables/shop.orders": (url: string) =>
+      url.includes("notes_after=2")
+        ? { ...info, notes: [note(3)], notes_total: 3, notes_next: null }
+        : { ...info, notes: [note(1), note(2)], notes_total: 3, notes_next: 2 },
+  });
+  render(<TableDetail name="shop.orders" />);
+  await userEvent.click(await screen.findByRole("tab", { name: /Notes and tags \(3\)/ }));
+  expect(screen.queryByText("note 3")).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Show more notes (2 of 3)" }));
+  expect(await screen.findByText("note 3")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /Show more notes/ })).toBeNull();
+  expect(f).toBeDefined();
 });

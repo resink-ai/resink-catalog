@@ -1,8 +1,12 @@
-"""FastAPI app. Every route except /healthz requires the access token."""
+"""FastAPI app. The API, Iceberg and MCP routes need the access token in an Authorization header. The web page's own
+files (HTML, JS, CSS) carry no data and are served without it: the browser opens the link with the token in the URL
+fragment, which is never sent to any server, and the page sends the token as a header."""
 
 from __future__ import annotations
 
 import secrets
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -14,13 +18,14 @@ from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError
 from . import __version__
 from .catalog import Catalog, ImportErrorForUser
 from .iceberg_rest import build_router
+from .mcp_server import build_server
 from .query import QueryError
 
 PUBLIC_PATHS = frozenset({"/healthz"})
+PROTECTED_PREFIXES = ("/api/", "/iceberg/", "/mcp")  # everything else is the page's own static files
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
 
 
-COOKIE = "rc_token"
 STATIC_DIR = Path(__file__).parent / "static"
 NO_UI = (
     "<!doctype html><meta charset=utf-8><title>Resink Catalog</title>"
@@ -31,17 +36,9 @@ NO_UI = (
 )
 
 
-def _extract_token(request: Request) -> tuple[str | None, str]:
-    """The supplied token and where it came from: 'header', 'query' or 'cookie'."""
-    auth = request.headers.get("authorization", "")
-    scheme, _, value = auth.partition(" ")
-    if scheme.lower() == "bearer" and value:
-        return value.strip(), "header"
-    # The browser is opened on a link carrying the token (design section 4); it is then kept in a cookie so the
-    # page's scripts and API calls carry it without JavaScript ever handling it.
-    if "token" in request.query_params:
-        return request.query_params["token"], "query"
-    return request.cookies.get(COOKIE), "cookie"
+def _bearer(request: Request) -> str | None:
+    scheme, _, value = request.headers.get("authorization", "").partition(" ")
+    return value.strip() if scheme.lower() == "bearer" and value else None
 
 
 class QueryBody(BaseModel):
@@ -61,6 +58,15 @@ class ImportBody(BaseModel):
     column_types: dict[str, str] | None = None  # override inferred types (file or source_id only)
 
 
+class TagsBody(BaseModel):
+    tags: list[str]
+
+
+class NoteBody(BaseModel):
+    target: str | None = None  # the table itself, or 'ns.table.column'; defaults to the table in the URL
+    body: str
+
+
 class TypesBody(BaseModel):
     column_types: dict[str, str]
 
@@ -70,7 +76,14 @@ class ScanBody(BaseModel):
 
 
 def create_app(token: str, home: Path | str | None = None) -> FastAPI:
-    app = FastAPI(title="Resink Local Catalog", version=__version__, docs_url=None, redoc_url=None)
+    mcp_app = None  # built below, after `catalog` exists; its session manager must run inside our lifespan
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        async with mcp_app.router.lifespan_context(mcp_app):
+            yield
+
+    app = FastAPI(title="Resink Local Catalog", version=__version__, docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.catalog = None
 
     def catalog() -> Catalog:
@@ -78,15 +91,19 @@ def create_app(token: str, home: Path | str | None = None) -> FastAPI:
             app.state.catalog = Catalog(home)
         return app.state.catalog
 
+    mcp_app = build_server(catalog).streamable_http_app(streamable_http_path="/")
+
     @app.middleware("http")
     async def require_token(request: Request, call_next):
+        if request.scope["path"] == "/mcp":
+            request.scope["path"] = "/mcp/"  # the MCP app is mounted at /mcp; do not bounce POSTs through a redirect
         # Applies to every path, including ones that do not exist, so probing reveals nothing.
         host = request.headers.get("host", "").rsplit(":", 1)[0]
         if host not in LOOPBACK_HOSTS:  # blocks DNS rebinding
             return JSONResponse({"detail": "forbidden host"}, status_code=403)
-        via = "none"
-        if request.url.path not in PUBLIC_PATHS:
-            supplied, via = _extract_token(request)
+        path = request.url.path
+        if path not in PUBLIC_PATHS and (path + "/").startswith(PROTECTED_PREFIXES):
+            supplied = _bearer(request)
             if supplied is None or not secrets.compare_digest(supplied, token):
                 return JSONResponse(
                     {"detail": "missing or invalid access token"},
@@ -94,13 +111,10 @@ def create_app(token: str, home: Path | str | None = None) -> FastAPI:
                     headers={"WWW-Authenticate": "Bearer"},
                 )
             origin = request.headers.get("origin")
-            if via == "cookie" and request.method not in ("GET", "HEAD") and origin:
-                if origin.split("://", 1)[-1] != request.headers.get("host"):  # another site or port using our cookie
+            if origin and request.method not in ("GET", "HEAD"):
+                if origin.split("://", 1)[-1] != request.headers.get("host"):  # a page on another port or site
                     return JSONResponse({"detail": "cross-origin request refused"}, status_code=403)
-        response = await call_next(request)
-        if via == "query":
-            response.set_cookie(COOKIE, token, httponly=True, samesite="strict", path="/")
-        return response
+        return await call_next(request)
 
     @app.get("/healthz")
     def healthz() -> dict:
@@ -111,6 +125,7 @@ def create_app(token: str, home: Path | str | None = None) -> FastAPI:
         return {"name": "resink-catalog", "version": __version__}
 
     app.include_router(build_router(lambda: catalog().iceberg))
+    app.mount("/mcp", mcp_app)  # MCP over HTTP, behind the same token as every other route
 
     @app.exception_handler(ImportErrorForUser)
     def _user_error(request: Request, exc: ImportErrorForUser):
@@ -132,9 +147,9 @@ def create_app(token: str, home: Path | str | None = None) -> FastAPI:
             raise HTTPException(404, f"no such table: {name}") from None
 
     @app.get("/api/v1/tables/{name}")
-    def table(name: str) -> dict:
+    def table(name: str, notes_after: int = 0, notes_limit: int = 50) -> dict:
         try:
-            return catalog().table_info(name)
+            return catalog().table_info(name, notes_after, notes_limit)
         except (NoSuchTableError, NoSuchNamespaceError):
             raise HTTPException(404, f"no such table: {name}") from None
 
@@ -145,6 +160,26 @@ def create_app(token: str, home: Path | str | None = None) -> FastAPI:
     @app.get("/api/v1/sources")
     def sources(status: str | None = None) -> list[dict]:
         return catalog().sources(status)
+
+    @app.post("/api/v1/tables/{name}/tags")
+    def add_tags(name: str, body: TagsBody) -> list[dict]:
+        return catalog().add_tags(name, body.tags, source="user")
+
+    @app.delete("/api/v1/tags/{tag_id}")
+    def remove_tag(tag_id: int) -> dict:
+        if not catalog().remove_tag(tag_id):
+            raise HTTPException(404, f"no such tag: {tag_id}")
+        return {"removed": tag_id}
+
+    @app.post("/api/v1/tables/{name}/notes")
+    def add_note(name: str, body: NoteBody) -> dict:
+        return catalog().write_note(body.target or name, body.body, author="user")
+
+    @app.delete("/api/v1/notes/{note_id}")
+    def delete_note(note_id: int) -> dict:
+        if not catalog().delete_note(note_id):
+            raise HTTPException(404, f"no such note: {note_id}")
+        return {"removed": note_id}
 
     @app.get("/api/v1/roots")
     def roots() -> list[dict]:

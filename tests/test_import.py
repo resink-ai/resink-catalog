@@ -28,7 +28,7 @@ def test_csv_becomes_an_iceberg_table(tmp_path, catalog):
 
 def test_default_table_name_comes_from_the_file(tmp_path, catalog):
     catalog.import_file(_csv(tmp_path / "My Export (2).csv", ["1,a,1"]))
-    assert [t["name"] for t in catalog.list_tables()] == ["default.my_export_2"]
+    assert [t["name"] for t in catalog.list_tables()] == ["main.my_export_2"]
 
 
 def test_reimport_unchanged_creates_no_snapshot(tmp_path, catalog):
@@ -50,11 +50,11 @@ def test_touching_a_file_without_changing_content_is_not_a_change(tmp_path, cata
 def test_changed_content_makes_a_new_snapshot_and_history_stays_queryable(tmp_path, catalog):
     f = _csv(tmp_path / "a.csv", ["1,x,1", "2,y,2"])
     catalog.import_file(f, "t")
-    first = catalog.iceberg.load_table(("default", "t")).current_snapshot().snapshot_id
+    first = catalog.iceberg.load_table(("main", "t")).current_snapshot().snapshot_id
     _csv(f, ["1,x,1", "2,y,2", "3,z,3"])
     r = catalog.import_file(f)
     assert (r.outcome, r.rows) == ("updated", 3)
-    table = catalog.iceberg.load_table(("default", "t"))
+    table = catalog.iceberg.load_table(("main", "t"))
     assert table.current_snapshot().snapshot_id != first
     assert len(table.scan().to_arrow()) == 3
     old = table.scan(snapshot_id=first).to_arrow()  # time travel to the first import

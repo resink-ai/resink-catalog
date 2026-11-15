@@ -26,4 +26,4 @@ def test_init_db_idempotent(tmp_path):
     conn = sqlite3.connect(tmp_path / "catalog.db")
     rows = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchall()
     conn.close()
-    assert rows == [("3",)]
+    assert rows == [("4",)]

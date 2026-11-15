@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import warnings
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
-from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
+from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchNamespaceError, NoSuchTableError
 from pyiceberg.expressions import EqualTo
 
 from .home import default_home, ensure_home, init_db
@@ -22,11 +23,24 @@ from .query import query_arrow, run_query
 from .readers import ReadError, apply_types, detect_format, file_hash, read_file, type_name
 from .store import DEFAULT_NAMESPACE, open_iceberg, slug, split_name
 
+log = logging.getLogger(__name__)
+
 SOURCE_COLUMN = "_source_file"  # present in tables built from several export files of one source
 SOURCE_FIELDS = (
     "id root_id path format content_hash target_table mode last_import status error rows column_types".split()
 )
 DATE_PARTS = re.compile(r"(\d{4}[-_]?\d{2}[-_]?\d{2}|\d{8}|\d{4}[-_]\d{2}|\d+)")
+
+
+SOURCES_OF_TEXT = ("user", "ai")  # who wrote a tag or note
+MAX_TAG, MAX_TAGS_PER_CALL, MAX_NOTE = 64, 20, 5000
+# Cumulative limits, so a looping or injected assistant cannot fill the disk or the reader's context. The AI's
+# limits are lower than the user's, so it can never use up the room the user needs.
+LIMITS = {
+    "ai": {"tags_per_table": 30, "notes_per_table": 100, "notes_total": 5000},
+    "user": {"tags_per_table": 100, "notes_per_table": 1000, "notes_total": 50000},
+}
+NOTES_PAGE = 50
 
 
 class ImportErrorForUser(Exception):
@@ -60,6 +74,32 @@ class Catalog:
         self.home = ensure_home(Path(home) if home else default_home())
         self.db_path = init_db(self.home)
         self.iceberg = open_iceberg(self.home)
+        self.migrated = self._migrate_default_namespace()
+
+    def _migrate_default_namespace(self) -> list[str]:
+        """Catalogs made before the rename have their tables in `default`: move them to `main` (nothing is released
+        yet, but a developer's catalog should keep working). Returns the moved table names; logs what it did."""
+        old, new = "default", DEFAULT_NAMESPACE
+        if (old,) not in self.iceberg.list_namespaces() or (new,) in self.iceberg.list_namespaces():
+            return []
+        self._ensure_namespace(new)
+        moved = []
+        for _, name in self.iceberg.list_tables(old):
+            self.iceberg.rename_table((old, name), (new, name))  # the catalog row moves; data files stay in place
+            moved.append(f"{new}.{name}")
+        if not self.iceberg.list_tables(old):
+            self.iceberg.drop_namespace(old)
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            for m in moved:
+                o = f"{old}.{m.split('.', 1)[1]}"
+                conn.execute("UPDATE data_sources SET target_table = ? WHERE target_table = ?", (m, o))
+                conn.execute("UPDATE tags SET table_name = ? WHERE table_name = ?", (m, o))
+                conn.execute("UPDATE notes SET target = ? WHERE target = ?", (m, o))
+                conn.execute(
+                    "UPDATE notes SET target = ? || substr(target, ?) WHERE target LIKE ?", (m, len(o) + 1, o + ".%")
+                )
+        log.info("moved %d table(s) from namespace %r to %r: %s", len(moved), old, new, ", ".join(moved))
+        return moved
 
     # ------------------------------------------------------------------ tables
 
@@ -70,6 +110,9 @@ class Catalog:
             pass
 
     def list_tables(self) -> list[dict]:
+        tags: dict[str, list[dict]] = defaultdict(list)
+        for t in self.list_tags():
+            tags[t["table"]].append({"id": t["id"], "tag": t["tag"], "source": t["source"]})
         out = []
         for ns in self.iceberg.list_namespaces():
             for ident in self.iceberg.list_tables(ns):
@@ -82,6 +125,7 @@ class Catalog:
                         "snapshots": len(t.metadata.snapshots),
                         "current_snapshot_id": snap.snapshot_id if snap else None,
                         "rows": int(snap.summary["total-records"]) if snap and snap.summary else 0,
+                        "tags": tags.get(".".join(ident), []),
                     }
                 )
         return sorted(out, key=lambda d: d["name"])
@@ -101,11 +145,142 @@ class Catalog:
             blockers.append(f"format version {t.metadata.format_version}")
         return blockers
 
-    def table_info(self, name: str) -> dict:
+    # -------------------------------------------------------------- tags and notes (design section 5)
+
+    def _canonical(self, name: str) -> str:
+        """'t' -> 'main.t'; raises when the table does not exist, so annotations never point at nothing."""
+        ns, tbl = split_name(name)
+        try:
+            self.iceberg.load_table((ns, tbl))
+        except (NoSuchTableError, NoSuchNamespaceError):
+            raise ImportErrorForUser(f"no such table: {ns}.{tbl}") from None
+        return f"{ns}.{tbl}"
+
+    def _target(self, target: str) -> str:
+        """A note is about a table ('shop.orders') or one of its columns ('shop.orders.amount')."""
+        parts = target.split(".")
+        if len(parts) >= 3:
+            table, column = ".".join(parts[:2]), ".".join(parts[2:])
+        elif len(parts) == 2 and not self._exists(target):
+            raise ImportErrorForUser(f"no such table: {target}")
+        else:
+            table, column = target, None
+        canonical = self._canonical(table)
+        if column is not None:
+            names = [f.name for f in self.iceberg.load_table(split_name(canonical)).schema().fields]
+            if column not in names:
+                raise ImportErrorForUser(f"table {canonical} has no column {column!r}")
+            return f"{canonical}.{column}"
+        return canonical
+
+    def add_tags(self, table: str, tags: list[str], source: str = "user") -> list[dict]:
+        """Add tags to a table (existing ones are kept; a tag keeps the source that first wrote it)."""
+        if source not in SOURCES_OF_TEXT:
+            raise ValueError("source must be 'user' or 'ai'")
+        cleaned = list(dict.fromkeys(t.strip().lower() for t in tags if t and t.strip()))
+        if not cleaned or len(cleaned) > MAX_TAGS_PER_CALL:
+            raise ImportErrorForUser(f"give between 1 and {MAX_TAGS_PER_CALL} tags")
+        if any(len(t) > MAX_TAG or any(c in t for c in "\n\r\t") for t in cleaned):
+            raise ImportErrorForUser(f"a tag is at most {MAX_TAG} characters on one line")
+        name = self._canonical(table)
+        with closing(self._conn()) as conn, conn:
+            have = {r[0] for r in conn.execute("SELECT tag FROM tags WHERE table_name = ?", (name,))}
+            by_author = conn.execute(
+                "SELECT COUNT(*) FROM tags WHERE table_name = ? AND source = ?", (name, source)
+            ).fetchone()[0]
+            if by_author + len([t for t in cleaned if t not in have]) > LIMITS[source]["tags_per_table"]:
+                limit = LIMITS[source]["tags_per_table"]
+                raise ImportErrorForUser(f"{name} already has {by_author} tags from {source}; the limit is {limit}")
+            for tag in cleaned:
+                conn.execute(
+                    "INSERT OR IGNORE INTO tags (table_name, tag, source, created_at) VALUES (?, ?, ?, ?)",
+                    (name, tag, source, _now()),
+                )
+        return self.list_tags(name)
+
+    def list_tags(self, table: str | None = None) -> list[dict]:
+        with closing(self._conn()) as conn:
+            q = 'SELECT id, table_name AS "table", tag, source, created_at FROM tags'
+            args: tuple = ()
+            if table is not None:
+                q += " WHERE table_name = ?"
+                args = (self._canonical(table),)
+            return [dict(r) for r in conn.execute(q + " ORDER BY table_name, tag", args)]
+
+    def remove_tag(self, tag_id: int) -> bool:
+        """Delete by id: a tag may contain any character, including '/', which cannot travel in a URL path."""
+        with closing(self._conn()) as conn, conn:
+            return conn.execute("DELETE FROM tags WHERE id = ?", (tag_id,)).rowcount > 0
+
+    def write_note(self, target: str, body: str, author: str = "user") -> dict:
+        """Add a note (Markdown) about a table or one column. Notes are kept, never overwritten."""
+        if author not in SOURCES_OF_TEXT:
+            raise ValueError("author must be 'user' or 'ai'")
+        body = body.strip()
+        if not body or len(body) > MAX_NOTE:
+            raise ImportErrorForUser(f"a note has between 1 and {MAX_NOTE} characters")
+        where = self._target(target)
+        table = ".".join(where.split(".")[:2])
+        limits = LIMITS[author]
+        with closing(self._conn()) as conn, conn:
+            in_table = conn.execute(
+                "SELECT COUNT(*) FROM notes WHERE author = ? AND (target = ? OR substr(target, 1, ?) = ?)",
+                (author, table, len(table) + 1, table + "."),
+            ).fetchone()[0]
+            total = conn.execute("SELECT COUNT(*) FROM notes WHERE author = ?", (author,)).fetchone()[0]
+            if in_table >= limits["notes_per_table"] or total >= limits["notes_total"]:
+                raise ImportErrorForUser(
+                    f"too many notes from {author}: {in_table} on {table} (limit {limits['notes_per_table']}), "
+                    f"{total} in all (limit {limits['notes_total']}). Delete old ones first."
+                )
+            cur = conn.execute(
+                "INSERT INTO notes (target, body, author, created_at) VALUES (?, ?, ?, ?)",
+                (where, body, author, _now()),
+            )
+        return self.get_note(cur.lastrowid)
+
+    def get_note(self, note_id: int) -> dict:
+        with closing(self._conn()) as conn:
+            row = conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
+        if row is None:
+            raise ImportErrorForUser(f"no such note: {note_id}")
+        return dict(row)
+
+    def list_notes(self, table: str | None = None, after: int = 0, limit: int = NOTES_PAGE) -> list[dict]:
+        """Notes about a table and its columns, oldest first, one page at a time: pass the last id seen as `after`."""
+        limit = max(1, min(limit, 200))
+        with closing(self._conn()) as conn:
+            if table is None:
+                rows = conn.execute("SELECT * FROM notes WHERE id > ? ORDER BY id LIMIT ?", (after, limit))
+            else:
+                name = self._canonical(table)
+                rows = conn.execute(  # a literal prefix, not LIKE: '_' and '%' in table names are ordinary characters
+                    "SELECT * FROM notes WHERE id > ? AND (target = ? OR substr(target, 1, ?) = ?) ORDER BY id LIMIT ?",
+                    (after, name, len(name) + 1, name + ".", limit),
+                )
+            return [dict(r) for r in rows]
+
+    def count_notes(self, table: str) -> int:
+        name = self._canonical(table)
+        with closing(self._conn()) as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM notes WHERE target = ? OR substr(target, 1, ?) = ?",
+                (name, len(name) + 1, name + "."),
+            ).fetchone()[0]
+
+    def delete_note(self, note_id: int) -> bool:
+        with closing(self._conn()) as conn, conn:
+            return conn.execute("DELETE FROM notes WHERE id = ?", (note_id,)).rowcount > 0
+
+    def table_info(self, name: str, notes_after: int = 0, notes_limit: int = NOTES_PAGE) -> dict:
         ns, tbl = split_name(name)
         t = self.iceberg.load_table((ns, tbl))
         blockers = self.push_blockers(name)
         return {
+            "tags": [{"id": t["id"], "tag": t["tag"], "source": t["source"]} for t in self.list_tags(f"{ns}.{tbl}")],
+            "notes": (page := self.list_notes(f"{ns}.{tbl}", notes_after, notes_limit)),
+            "notes_total": self.count_notes(f"{ns}.{tbl}"),
+            "notes_next": page[-1]["id"] if len(page) == max(1, min(notes_limit, 200)) else None,
             "push_ready": not blockers,
             "push_blockers": blockers,
             "name": f"{ns}.{tbl}",
@@ -305,7 +480,7 @@ class Catalog:
     def import_file(
         self, path: Path | str, table: str | None = None, column_types: dict[str, str] | None = None
     ) -> ImportResult:
-        """Import one file now. Without `table` it goes to default.<file name>. `column_types` overrides the
+        """Import one file now. Without `table` it goes to main.<file name>. `column_types` overrides the
         inferred types (and is remembered for later imports of the same file)."""
         source_id = self.register_file(path, table)
         if column_types is not None:
