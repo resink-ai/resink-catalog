@@ -47,6 +47,8 @@ dev = [
   "ruff>=0.6",
   "openapi-spec-validator>=0.9.0",
   "pyyaml>=6.0.3",
+  "packaging>=24",
+  "tomli>=2; python_version < '3.11'",  # scripts/licenses.py reads uv.lock
 ]
 
 [build-system]

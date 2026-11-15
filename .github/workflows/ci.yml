@@ -23,11 +23,13 @@ jobs:
       # The DuckDB tests fail instead of skipping: the extensions are installed in the step below.
       RESINK_CATALOG_REQUIRE_DUCKDB_EXTENSIONS: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: ${{ matrix.python }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -54,11 +56,14 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - run: docker build -t resink-catalog:ci .
       - name: The container serves on its own interface and answers /healthz
         run: |
-          docker run -d --name rc -p 127.0.0.1:8765:8765 resink-catalog:ci
+          mkdir "$RUNNER_TEMP/data"   # owned by the runner user, like a user's own directory: the README's command
+          docker run -d --name rc --user "$(id -u):$(id -g)" -p 127.0.0.1:8765:8765 -v "$RUNNER_TEMP/data:/data" resink-catalog:ci
           for i in $(seq 1 30); do curl -fs http://127.0.0.1:8765/healthz && break; sleep 1; done
           curl -fs http://127.0.0.1:8765/healthz
           docker logs rc | head -1 | grep -q '#token='

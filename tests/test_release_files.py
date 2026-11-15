@@ -54,3 +54,45 @@ def test_extension_script_installs_what_the_duckdb_tests_load():
     tests = (ROOT / "tests" / "test_duckdb_rest.py").read_text()
     for ext in ("httpfs", "iceberg"):
         assert f'"{ext}"' in script and f'"{ext}"' in tests
+
+
+def _uses():
+    for name in ("ci", "release"):
+        for job in workflow(name)["jobs"].values():
+            for step in job["steps"]:
+                if "uses" in step:
+                    yield name, step["uses"]
+
+
+def test_every_action_is_pinned_to_a_full_commit_sha():
+    import re
+
+    refs = list(_uses())
+    assert len(refs) >= 10
+    assert [r for r in refs if not re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", r[1])] == []
+    for name in ("ci", "release"):  # the tag stays visible for reviewers, as a comment
+        text = (ROOT / ".github" / "workflows" / f"{name}.yml").read_text()
+        assert all("# " in line for line in text.splitlines() if "uses: " in line)
+
+
+def test_workflows_have_least_privilege_permissions_and_do_not_keep_checkout_credentials():
+    for name in ("ci", "release"):
+        wf = workflow(name)
+        assert wf["permissions"] == {"contents": "read"}
+        for job in wf["jobs"].values():
+            for step in job["steps"]:
+                if step.get("uses", "").startswith("actions/checkout@"):
+                    assert step["with"]["persist-credentials"] is False
+    jobs = workflow("release")["jobs"]
+    assert jobs["pypi"]["permissions"] == {"id-token": "write"}  # only the publishing job can mint the identity
+    assert jobs["docker"]["permissions"] == {"contents": "read", "packages": "write"}
+
+
+def test_the_docker_image_is_reproducible_and_runs_with_the_documented_user_flag():
+    text = (ROOT / "Dockerfile").read_text()
+    import re
+
+    froms = re.findall(r"^FROM (\S+)", text, re.M)
+    assert froms and all(re.search(r"@sha256:[0-9a-f]{64}$", f) for f in froms), froms
+    assert "uv export --frozen --no-dev" in text and "--require-hashes" in text
+    assert '--user "$(id -u):$(id -g)"' in text and '--user "$(id -u):$(id -g)"' in (ROOT / "README.md").read_text()

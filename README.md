@@ -14,10 +14,10 @@ resink-catalog serve                  # http://127.0.0.1:8765, opens the browser
 Python 3.10 or newer; macOS, Windows and Linux. With Docker, publish the port on your own machine only and mount your data:
 
 ```bash
-docker run --rm -p 127.0.0.1:8765:8765 -v "$HOME/.resink-catalog:/data" -v "$HOME/exports:/exports:ro" ghcr.io/resink-ai/resink-catalog
+docker run --rm --user "$(id -u):$(id -g)" -p 127.0.0.1:8765:8765 -v "$HOME/.resink-catalog:/data" -v "$HOME/exports:/exports:ro" ghcr.io/resink-ai/resink-catalog
 ```
 
-The access token is on the first line of the log (`docker logs`). Inside the container the process listens on the container's interface (the image sets `RESINK_CATALOG_IN_CONTAINER=1`); the token and the `Host` check still apply, and the `127.0.0.1:` in the command keeps the port off your network. Do not publish it as `-p 8765:8765`.
+`--user` makes the container run as you, so it can write to the directory you mount (without it the process is uid 10001 and only a Docker named volume works). The access link is on the first line of the log (`docker logs`). Inside the container the process listens on the container's interface (the image sets `RESINK_CATALOG_IN_CONTAINER=1`); the token and the `Host` check still apply, and the `127.0.0.1:` in the command keeps the port off your network. Do not publish it as `-p 8765:8765`.
 
 ## Run from a source checkout
 
@@ -65,13 +65,17 @@ resink-catalog backup ~/backups/catalog-2026-11-14      # a new or empty directo
 resink-catalog restore ~/backups/catalog-2026-11-14 [--replace]
 ```
 
-`backup` takes the catalog's write lock (imports, REST commits and snapshot expiry wait for it), copies `catalog.db` with SQLite's online backup API, then copies exactly the files the catalog references (every snapshot's metadata, manifests and data files; leftovers of an interrupted import are skipped), and writes `manifest.json` with a SHA-256 per file last, so a directory without it is not a backup. The access token and push credentials are never included. `restore` verifies every checksum before it changes anything, copies the files first and `catalog.db` last, checks SQLite integrity and that every referenced file exists. With `--replace` an existing catalog is moved aside (`catalog.db.replaced-<time>`), never deleted.
+`backup` takes the catalog's write lock (imports, REST commits and snapshot expiry wait for it), copies `catalog.db` with SQLite's online backup API, then copies exactly the files the catalog references (every snapshot's metadata, manifests and data files; leftovers of an interrupted import are skipped), and writes `manifest.json` with a SHA-256 per file last, so a directory without it is not a backup. The access token and push credentials are never included. `restore` first checks the manifest (only relative paths under `warehouse/`, no symbolic links, no duplicates) and every checksum, stages a full copy inside the catalog directory, and only then swaps it in with renames; if anything fails it renames the old catalog back. With `--replace` an existing `catalog.db` (and its `-wal`/`-shm` files) and `warehouse/` are moved aside (`*.replaced-<time>`), never deleted. It refuses while any process has the catalog open (a running `serve` or `mcp`): stop them first. A backup restores only to the directory it was made from, because Iceberg metadata records absolute paths.
 
 Limit: Iceberg metadata records absolute paths, so a backup restores only to the directory it was made from (restoring elsewhere is refused with that explanation). Moving a catalog to another machine with a different home directory is not supported yet.
 
+## Cleanup of interrupted imports
+
+An import that is killed part-way leaves data files nothing references. `serve` removes unreferenced warehouse files older than 24 hours when it starts; `resink-catalog cleanup [--min-age-hours N] [--dry-run]` does the same on demand. Files younger than the limit are left alone, because another process may still be importing.
+
 ## Push credentials
 
-The push client (a later milestone) stores its device tokens in the macOS Keychain or the Windows Credential Manager, and on Linux in `~/.config/resink-catalog/credentials.json` with mode 0600 (`RESINK_CATALOG_CREDENTIALS_DIR` overrides the directory). They are never written to `catalog.db`, and `backup` does not copy them. The local access token (`~/.resink-catalog/token`) is a different thing: it only protects your own local server.
+The push client (a later milestone) stores its device tokens in the macOS Keychain or the Windows Credential Manager, chosen explicitly (not whatever backend the `keyring` package happens to select). If none is usable, for example on Linux, it refuses. Setting `RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS=1` opts in to a file `~/.config/resink-catalog/credentials.json` with mode 0600 (`RESINK_CATALOG_CREDENTIALS_DIR` overrides the directory), with a warning in the log; this is not offered on Windows. Tokens are never written to `catalog.db`, and `backup` does not copy them. The local access token (`~/.resink-catalog/token`) is a different thing: it only protects your own local server.
 
 ## Import your files
 

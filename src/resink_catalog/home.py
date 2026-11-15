@@ -67,8 +67,7 @@ def ensure_home(home: Path) -> Path:
             # fine when nobody else can enter it; otherwise refuse, since the token and catalog live here.
             if home.stat().st_mode & 0o077:
                 raise PermissionError(
-                    f"{home} is not owned by this user and is accessible to others; "
-                    f"run `chmod 700 {home}` as its owner"
+                    f"{home} is not owned by this user and is accessible to others; run `chmod 700 {home}` as its owner"
                 ) from None
     return home
 
