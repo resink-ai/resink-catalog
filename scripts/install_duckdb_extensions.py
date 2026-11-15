@@ -8,7 +8,7 @@ import sys
 
 import duckdb
 
-EXTENSIONS = ("httpfs", "iceberg")
+EXTENSIONS = ("httpfs", "avro", "iceberg")  # iceberg needs avro since DuckDB 1.5
 
 
 def main() -> int:
