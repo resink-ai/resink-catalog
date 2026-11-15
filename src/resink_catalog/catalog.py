@@ -10,7 +10,7 @@ import warnings
 from collections import defaultdict
 from contextlib import closing
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,7 @@ from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchNamespaceErr
 from pyiceberg.expressions import EqualTo
 
 from .home import default_home, ensure_home, init_db
+from .lock import CatalogLock
 from .query import query_arrow, run_query
 from .readers import ReadError, apply_types, detect_format, file_hash, read_file, type_name
 from .store import DEFAULT_NAMESPACE, open_iceberg, slug, split_name
@@ -61,7 +62,7 @@ class ImportResult:
 
 
 def _now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _group_key(path: Path) -> str:
@@ -70,11 +71,18 @@ def _group_key(path: Path) -> str:
 
 
 class Catalog:
-    def __init__(self, home: Path | str | None = None):
+    def __init__(self, home: Path | str | None = None, lock: bool = True):
         self.home = ensure_home(Path(home) if home else default_home())
+        # shared with every other open catalog; `restore` needs it exclusive and so refuses while any is open
+        self._lock = CatalogLock(self.home) if lock else None
         self.db_path = init_db(self.home)
         self.iceberg = open_iceberg(self.home)
         self.migrated = self._migrate_default_namespace()
+
+    def close(self) -> None:
+        """Release the catalog directory's lock (also released when the object is garbage collected)."""
+        if self._lock is not None:
+            self._lock.release()
 
     def _migrate_default_namespace(self) -> list[str]:
         """Catalogs made before the rename have their tables in `default`: move them to `main` (nothing is released

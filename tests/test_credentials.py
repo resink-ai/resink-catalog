@@ -1,4 +1,4 @@
-"""Token storage: OS credential store on macOS and Windows, a 0600 file elsewhere, never in catalog.db or a backup."""
+"""Token storage: the OS credential store, failing closed; a 0600 file only by explicit opt-in; never in catalog.db or a backup."""
 
 import os
 import stat
@@ -10,7 +10,7 @@ import pytest
 
 from resink_catalog import Catalog
 from resink_catalog.backup import backup
-from resink_catalog.credentials import FileStore, KeyringStore, open_store
+from resink_catalog.credentials import FileStore, KeyringStore, NoSecureStore, open_store
 
 
 def test_file_store_round_trip_with_private_permissions(tmp_path):
@@ -49,11 +49,19 @@ class FakeKeyring(types.SimpleNamespace):
         del self.store[(service, name)]
 
 
+def fake_backend_modules(monkeypatch, priority=5):
+    """keyring.backends.macOS / Windows do not import on Linux; stand-ins prove the explicit choice."""
+    backend = FakeKeyring()
+    backend.priority = priority
+    for mod, cls in (("keyring.backends.macOS", "Keyring"), ("keyring.backends.Windows", "WinVaultKeyring")):
+        monkeypatch.setitem(sys.modules, mod, types.SimpleNamespace(**{cls: lambda: backend}))
+    return backend
+
+
 @pytest.mark.parametrize(("platform", "kind"), [("darwin", "macOS Keychain"), ("win32", "Windows Credential Manager")])
-def test_macos_and_windows_use_the_os_store(monkeypatch, platform, kind):
-    fake = FakeKeyring()
-    monkeypatch.setitem(sys.modules, "keyring", fake)
-    store = open_store(platform)
+def test_macos_and_windows_use_their_native_store_chosen_explicitly(monkeypatch, platform, kind):
+    fake = fake_backend_modules(monkeypatch)
+    store = open_store(platform, env={})
     assert isinstance(store, KeyringStore) and store.kind == kind
     store.set("device", "tok")
     assert store.get("device") == "tok" and fake.store == {("resink-catalog", "device"): "tok"}
@@ -62,16 +70,37 @@ def test_macos_and_windows_use_the_os_store(monkeypatch, platform, kind):
     assert store.get("device") is None
 
 
-def test_linux_uses_the_private_file(monkeypatch, tmp_path):
+def test_an_unusable_native_store_fails_closed_even_if_keyring_has_another_backend(monkeypatch):
+    fake_backend_modules(monkeypatch, priority=0)  # the native backend says it cannot work here
+    with pytest.raises(NoSecureStore, match="no secure credential store"):
+        open_store("darwin", env={})
+    monkeypatch.setitem(sys.modules, "keyring.backends.macOS", None)  # package missing
+    with pytest.raises(NoSecureStore):
+        open_store("darwin", env={})
+
+
+def test_linux_has_no_os_store_so_it_fails_closed(monkeypatch, tmp_path):
     monkeypatch.setenv("RESINK_CATALOG_CREDENTIALS_DIR", str(tmp_path))
-    store = open_store("linux")
+    with pytest.raises(NoSecureStore, match="RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS"):
+        open_store("linux", env={})
+    assert not list(tmp_path.iterdir())  # nothing was written
+
+
+def test_the_plaintext_file_is_an_explicit_opt_in_with_a_warning(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv("RESINK_CATALOG_CREDENTIALS_DIR", str(tmp_path))
+    with caplog.at_level("WARNING"):
+        store = open_store("linux", env={"RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS": "1"})
     assert isinstance(store, FileStore) and store.path == tmp_path / "credentials.json"
+    assert "plaintext" in caplog.text
+    store.set("device", "t")
+    if os.name == "posix":
+        assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
 
 
-def test_without_the_keyring_package_the_file_is_the_fallback(monkeypatch, tmp_path):
-    monkeypatch.setenv("RESINK_CATALOG_CREDENTIALS_DIR", str(tmp_path))
-    monkeypatch.setitem(sys.modules, "keyring", None)  # import raises ImportError
-    assert isinstance(open_store("darwin"), FileStore)
+def test_windows_never_gets_the_plaintext_file(monkeypatch):
+    monkeypatch.setitem(sys.modules, "keyring.backends.Windows", None)
+    with pytest.raises(NoSecureStore):
+        open_store("win32", env={"RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS": "1"})  # no ACL is set by this code
 
 
 def test_tokens_never_reach_catalog_db_or_a_backup(tmp_path, monkeypatch):
@@ -79,7 +108,7 @@ def test_tokens_never_reach_catalog_db_or_a_backup(tmp_path, monkeypatch):
     home = tmp_path / "home"
     cat = Catalog(home)
     cat.write_table("t", pd.DataFrame({"a": [1]}))
-    open_store("linux").set("device", "SECRET-DEVICE-TOKEN")
+    open_store("linux", env={"RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS": "1"}).set("device", "SECRET-DEVICE-TOKEN")
     backup(home, tmp_path / "bk")
     for f in [home / "catalog.db", *(tmp_path / "bk").rglob("*")]:
         if f.is_file():

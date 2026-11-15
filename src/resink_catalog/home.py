@@ -60,7 +60,16 @@ def default_home() -> Path:
 def ensure_home(home: Path) -> Path:
     home.mkdir(parents=True, exist_ok=True)
     if os.name == "posix":
-        home.chmod(0o700)
+        try:
+            home.chmod(0o700)
+        except PermissionError:
+            # A directory that is not ours (a Docker bind mount owned by the host user) cannot be chmod-ed. That is
+            # fine when nobody else can enter it; otherwise refuse, since the token and catalog live here.
+            if home.stat().st_mode & 0o077:
+                raise PermissionError(
+                    f"{home} is not owned by this user and is accessible to others; "
+                    f"run `chmod 700 {home}` as its owner"
+                ) from None
     return home
 
 

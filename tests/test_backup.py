@@ -46,6 +46,7 @@ def test_restore_after_the_catalog_is_destroyed_gives_the_same_tables_history_ta
     rows_before = cat.query("select * from shop.orders order by id").to_dict("records")
     history_before = [s["snapshot_id"] for s in cat.table_info("shop.orders")["snapshots"]]
     backup(home, tmp_path / "bk")
+    cat.close()
     (home / "catalog.db").unlink()
     import shutil
 
@@ -64,6 +65,7 @@ def test_restore_refuses_an_existing_catalog_unless_replace_and_then_moves_it_as
     with pytest.raises(BackupError, match="already has a catalog"):
         restore(tmp_path / "bk", home)
     cat.write_table("shop.extra", pd.DataFrame({"x": [1]}))
+    cat.close()
     restore(tmp_path / "bk", home, replace=True)
     assert [t["name"] for t in Catalog(home).list_tables()] == ["shop.orders"]
     assert list(home.glob("catalog.db.replaced-*")) and list(home.glob("warehouse.replaced-*"))  # nothing deleted
@@ -143,5 +145,141 @@ def test_the_cli_backs_up_and_restores(cat, home, tmp_path, capsys):
     assert main(["backup", str(tmp_path / "bk"), "--home", str(home)]) == 1  # not empty
     assert "error:" in capsys.readouterr().err
     assert main(["restore", str(tmp_path / "bk"), "--home", str(home)]) == 1  # catalog exists
+    cat.close()
     assert main(["restore", str(tmp_path / "bk"), "--home", str(home), "--replace"]) == 0
     assert json.loads((tmp_path / "bk" / "manifest.json").read_text())["format"] == 1
+
+
+# ------------------------------------------------------------------------------------------ restore safety (TASK-9)
+
+
+def _edit_manifest(bk, fn):
+    m = json.loads((bk / "manifest.json").read_text())
+    fn(m)
+    (bk / "manifest.json").write_text(json.dumps(m))
+
+
+def _state(home):
+    return sorted(str(p.relative_to(home)) for p in home.rglob("*") if p.is_file() and p.name != ".catalog.lock")
+
+
+@pytest.mark.parametrize(
+    "evil",
+    [
+        "../victim",
+        "/etc/passwd",
+        "warehouse/../../victim",
+        "warehouse/../x",
+        "x/y",
+        "warehouse",
+        "warehouse/a\\b",
+        "C:/evil",
+        "",
+    ],
+)
+def test_restore_refuses_manifest_paths_outside_warehouse_and_touches_nothing(cat, home, tmp_path, evil):
+    bk = tmp_path / "bk"
+    backup(home, bk)
+    (tmp_path / "victim").write_text("do not overwrite")
+    (bk / "x").mkdir()
+    (bk / "x" / "y").write_text("y")
+    cat.close()
+    before = _state(home)
+    _edit_manifest(bk, lambda m: m["files"].append({"path": evil, "size": 1, "sha256": "0" * 64}))
+    with pytest.raises(BackupError, match="unsafe path|malformed"):
+        restore(bk, home, replace=True)
+    assert (tmp_path / "victim").read_text() == "do not overwrite" and _state(home) == before
+
+
+def test_restore_refuses_duplicates_and_symlinks(cat, home, tmp_path):
+    bk = tmp_path / "bk"
+    m = backup(home, bk)
+    cat.close()
+    first = m["files"][0]
+    _edit_manifest(bk, lambda mm: mm["files"].append(first))
+    with pytest.raises(BackupError, match="listed twice"):
+        restore(bk, home, replace=True)
+    _edit_manifest(bk, lambda mm: mm["files"].pop())
+    victim = bk / first["path"]
+    outside = tmp_path / "outside"
+    outside.write_bytes(victim.read_bytes())
+    victim.unlink()
+    victim.symlink_to(outside)  # same bytes, so the checksum would pass
+    with pytest.raises(BackupError, match="symbolic link"):
+        restore(bk, home, replace=True)
+
+
+def test_a_restore_that_fails_in_the_middle_of_the_swap_puts_the_old_catalog_back(cat, home, tmp_path, monkeypatch):
+    from resink_catalog import backup as backup_module
+
+    bk = tmp_path / "bk"
+    backup(home, bk)
+    cat.write_table("shop.extra", pd.DataFrame({"x": [1]}))  # the live catalog now differs from the backup
+    cat.close()
+    before = _state(home)
+    real, calls = backup_module._rename, []
+
+    def flaky(a, b):
+        calls.append((a.name, b.name))
+        if len(calls) == 4:  # db aside, warehouse aside, warehouse in, then the new catalog.db: fail there
+            raise OSError("disk full")
+        real(a, b)
+
+    monkeypatch.setattr(backup_module, "_rename", flaky)
+    with pytest.raises(OSError, match="disk full"):
+        restore(bk, home, replace=True)
+    monkeypatch.undo()
+    assert _state(home) == before and not list(home.glob(".restore-*")) and not list(home.glob("*.replaced-*"))
+    assert sorted(t["name"] for t in Catalog(home).list_tables()) == ["shop.extra", "shop.orders"]
+
+
+def test_a_manifest_that_omits_a_needed_file_is_refused_before_the_catalog_changes(cat, home, tmp_path):
+    bk = tmp_path / "bk"
+    backup(home, bk)
+    cat.close()
+    before = _state(home)
+    _edit_manifest(
+        bk, lambda m: m["files"].__setitem__(slice(None), [e for e in m["files"] if "metadata.json" not in e["path"]])
+    )
+    with pytest.raises(BackupError, match="does not contain"):
+        restore(bk, home, replace=True)
+    assert _state(home) == before
+
+
+def test_restore_refuses_while_the_catalog_is_open_and_handles_sqlite_sidecars(cat, home, tmp_path):
+    bk = tmp_path / "bk"
+    backup(home, bk)
+    with pytest.raises(BackupError, match="open in another process"):
+        restore(bk, home, replace=True)  # `cat` is open here, as a running server would be
+    assert Catalog(home).list_tables()[0]["rows"] == 4
+    cat.close()
+    import gc
+
+    gc.collect()
+    (home / "catalog.db-wal").write_bytes(b"stale")  # a leftover of a crashed process
+    restore(bk, home, replace=True)
+    assert not (home / "catalog.db-wal").exists()
+    assert list(home.glob("catalog.db-wal.replaced-*"))
+
+
+def test_a_running_server_blocks_restore(cat, home, tmp_path):
+    """The real thing: `serve` in a subprocess holds the lock while idle."""
+    import subprocess
+    import sys
+
+    bk = tmp_path / "bk"
+    backup(home, bk)
+    cat.close()
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "resink_catalog.cli", "serve", "--no-browser", "--port", "0", "--home", str(home)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert "listening" in proc.stdout.readline()
+        with pytest.raises(BackupError, match="open in another process"):
+            restore(bk, home, replace=True)
+    finally:
+        proc.terminate()
+        proc.wait(10)
+    restore(bk, home, replace=True)  # the server is gone: allowed

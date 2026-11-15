@@ -9,6 +9,7 @@ import socket
 import sys
 import webbrowser
 from collections.abc import Sequence
+from contextlib import closing
 from pathlib import Path
 
 import uvicorn
@@ -17,6 +18,7 @@ from . import __version__
 from .app import create_app
 from .catalog import Catalog, ImportErrorForUser
 from .home import default_home, ensure_home, init_db, load_or_create_token
+from .lock import CatalogInUse, CatalogLock
 
 DEFAULT_PORT = 8765
 HOST = "127.0.0.1"  # the address in every link; the catalog listens only here...
@@ -38,9 +40,26 @@ def _bind(port: int) -> socket.socket:
     return sock
 
 
+def _startup_cleanup(home: Path) -> None:
+    from .maintenance import remove_orphans
+
+    try:
+        with closing(Catalog(home)) as cat:
+            n = len(remove_orphans(cat))
+        if n:
+            print(f"removed {n} leftover file(s) of interrupted imports", file=sys.stderr, flush=True)
+    except Exception as e:  # housekeeping must never stop the server from starting
+        print(f"warning: startup cleanup skipped: {e}", file=sys.stderr, flush=True)
+
+
 def serve(home: Path, port: int, open_browser: bool) -> None:  # noqa: PLR0913
     ensure_home(home)
+    try:
+        hold = CatalogLock(home)  # held for the life of the server, even while idle, so `restore` refuses
+    except CatalogInUse:  # pragma: no cover - a shared lock only fails while a restore holds it
+        raise SystemExit("error: the catalog is being restored; try again when it is done") from None
     init_db(home)
+    _startup_cleanup(home)
     token = load_or_create_token(home)
     sock = _bind(port)
     actual_port = sock.getsockname()[1]
@@ -50,7 +69,10 @@ def serve(home: Path, port: int, open_browser: bool) -> None:  # noqa: PLR0913
     if open_browser:
         webbrowser.open(url)
     config = uvicorn.Config(create_app(token, home), log_level="warning")
-    uvicorn.Server(config).run(sockets=[sock])
+    try:
+        uvicorn.Server(config).run(sockets=[sock])
+    finally:
+        hold.release()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,6 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("source", type=Path, help="the backup directory")
     r.add_argument("--home", type=Path, default=None, help="data directory")
     r.add_argument("--replace", action="store_true", help="move an existing catalog aside instead of refusing")
+    c = sub.add_parser("cleanup", help="remove files left behind by interrupted imports (older than --min-age-hours)")
+    c.add_argument("--home", type=Path, default=None, help="data directory")
+    c.add_argument("--min-age-hours", type=float, default=24, help="leave younger files alone (default 24)")
+    c.add_argument("--dry-run", action="store_true", help="only list the files")
     for name, help_ in (
         ("import", "import a file, or apply the proposal for a folder added with add-folder"),
         ("add-folder", "find data files in a folder and propose tables; imports nothing"),
@@ -210,6 +236,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         except BackupError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
+        return 0
+    if args.command == "cleanup":
+        from .maintenance import remove_orphans
+
+        with closing(Catalog(args.home or default_home())) as cat:
+            files = remove_orphans(cat, args.min_age_hours * 3600, args.dry_run)
+        for f in files:
+            print(f"{'would remove' if args.dry_run else 'removed'} {f}")
+        print(f"{len(files)} file(s)")
         return 0
     if args.command == "serve":
         serve(args.home or default_home(), args.port, not args.no_browser)
