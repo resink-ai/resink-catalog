@@ -27,7 +27,7 @@ from urllib.request import url2pathname
 from .catalog import Catalog
 from .home import SCHEMA_VERSION
 from .lock import CatalogInUse, CatalogLock
-from .restore_journal import JOURNAL, finish, recover, undo, write_journal
+from .restore_journal import cleanup, durable_rename, fsync_dir, fsync_tree, recover, rollback, write_journal
 
 BACKUP_FORMAT = 1
 MANIFEST = "manifest.json"
@@ -183,8 +183,8 @@ def verify_backup(src: Path | str) -> dict:
 
 
 def _rename(a: Path, b: Path) -> None:
-    """The one place the swap renames; tests make it fail part-way."""
-    a.rename(b)
+    """The one place the swap renames (durably: both parent directories are fsynced); tests make it fail part-way."""
+    durable_rename(a, b)
 
 
 def _stage(src: Path, stage: Path, manifest: dict) -> None:
@@ -243,18 +243,28 @@ def restore(src: Path | str, home: Path | str, replace: bool = False) -> dict:
             f"the catalog at {home} is open in another process (a running `serve` or `mcp`, or a command); "
             "stop it and run restore again"
         ) from None
-    stage = replaced = None
-    moves: list[list[str]] = []
     try:
-        recover(home)  # an earlier restore that was killed: undo or finish it first
+        recover(home)  # an earlier restore that was killed: undo or finish it first. If this raises, its journal stays.
         if (home / "catalog.db").exists() and not replace:
             raise BackupError(f"{home} already has a catalog; pass --replace to move it aside and restore")
-        sidecars = [home / f"catalog.db{x}" for x in ("-wal", "-shm", "-journal")]  # leftovers: nobody has it open
-        existing = [p for p in (home / "catalog.db", *sidecars, home / "warehouse") if p.exists()]
-        # exclusively created, never reused: mkdtemp fails rather than return a name that exists
-        stage = Path(tempfile.mkdtemp(prefix=".restore-stage-", dir=home))
-        replaced = Path(tempfile.mkdtemp(prefix=".restore-replaced-", dir=home))
+        manifest = _swap_in(src, home, manifest)
+    finally:
+        lock.release()
+    return manifest
+
+
+def _swap_in(src: Path, home: Path, manifest: dict) -> dict:
+    """Stage, journal, swap, check, commit. Holds the exclusive lock (the caller's)."""
+    sidecars = [home / f"catalog.db{x}" for x in ("-wal", "-shm", "-journal")]  # leftovers: nobody has it open
+    existing = [p for p in (home / "catalog.db", *sidecars, home / "warehouse") if p.exists()]
+    # exclusively created, never reused: mkdtemp fails rather than return a name that exists
+    stage = Path(tempfile.mkdtemp(prefix=".restore-stage-", dir=home))
+    replaced = Path(tempfile.mkdtemp(prefix=".restore-replaced-", dir=home))
+    journal: dict | None = None  # set once this invocation has written its journal
+    try:
         _stage(src, stage, manifest)  # nothing in `home` has changed yet
+        fsync_tree(stage)  # the staged data is on disk before any journal says it may be swapped in
+        fsync_dir(home)  # the staging and replaced directories exist durably
         moves = [[str(p), str(replaced / p.name)] for p in existing]
         moves += [[str(stage / name), str(home / name)] for name in ("warehouse", "catalog.db")]
         journal = {"format": 1, "state": "swapping", "stage": str(stage), "replaced": str(replaced), "moves": moves}
@@ -265,28 +275,22 @@ def restore(src: Path | str, home: Path | str, replace: bool = False) -> dict:
             missing = [str(f) for f in referenced_files(cat) if not f.is_file()]
         if missing:
             raise BackupError(f"restored catalog references {len(missing)} missing file(s), for example {missing[0]}")
-        journal["state"] = "committed"
-        _commit_marker(home, journal)
+        committed = {**journal, "state": "committed"}
+        _commit_marker(home, committed)  # the swap renames are durable (fsynced parents) before this marker is
+        journal = committed
         had_old = any(replaced.iterdir())
-        finish(home, journal, keep_replaced=had_old)
+        cleanup(home, journal, keep_replaced=had_old)
         manifest["moved_aside"] = str(replaced) if had_old else None
     except BaseException:
-        if moves:
-            undo(moves)
-        if stage is not None:
+        if journal is not None and journal["state"] == "swapping":
+            rollback(home, journal)  # durable; if it raises, the journal stays for the next start
+        elif journal is None:  # failed while staging: nothing was moved and no journal exists
             shutil.rmtree(stage, ignore_errors=True)
-        if replaced is not None:
             try:
                 replaced.rmdir()
             except OSError:
                 pass
-        try:
-            (home / JOURNAL).unlink()
-        except FileNotFoundError:
-            pass
         raise
-    finally:
-        lock.release()
     return manifest
 
 

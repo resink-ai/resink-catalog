@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import time
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -424,3 +425,165 @@ def test_a_journal_that_names_paths_outside_home_is_refused(home, tmp_path):
     )
     with pytest.raises(RestoreRecoveryError, match="outside"):
         recover(home)
+
+
+# ------------------------------------------------------------------------------------------ round 3 (TASK-13)
+
+RECOVERY_CRASH = """
+import os, sys
+from pathlib import Path
+from resink_catalog import restore_journal as rj
+home, point = sys.argv[1], sys.argv[2]
+def hook(p):
+    if p == point:
+        os._exit(9)
+rj._hook = hook
+print(rj.recover(Path(home)))
+"""
+
+
+def _killed_restore(cat, home, tmp_path, point="after-rename-3"):
+    import gc
+    import subprocess
+    import sys
+
+    bk = tmp_path / "bk"
+    backup(home, bk)
+    cat.write_table("shop.extra", pd.DataFrame({"x": [1]}))  # the live catalog differs from the backup
+    cat.close()
+    gc.collect()
+    proc = subprocess.run([sys.executable, "-c", CRASH_SCRIPT, str(bk), str(home), point], capture_output=True)
+    assert proc.returncode == 9, proc.stderr.decode()[-300:]
+
+
+@pytest.mark.parametrize(
+    "point",
+    [f"undo-rename-{n}-{when}" for n in (1, 2, 3) for when in ("before", "after")]
+    + ["rolled-back-marker-before", "rolled-back-marker-after", "cleanup-after-stage", "journal-unlink-before"],
+)
+def test_recovery_killed_at_any_point_is_resumed_and_the_old_catalog_survives(cat, home, tmp_path, point):
+    """Round 3: recovery itself is killed (os._exit). The journal stays until its recovery completed, and a second
+    recovery ends with the old catalog intact, whatever the first one managed to do."""
+    import subprocess
+    import sys
+
+    _killed_restore(cat, home, tmp_path)
+    proc = subprocess.run([sys.executable, "-c", RECOVERY_CRASH, str(home), point], capture_output=True)
+    assert proc.returncode == 9, (point, proc.stdout, proc.stderr.decode()[-300:])
+    assert (home / ".restore-journal.json").exists()  # not removed before the recovery completed
+    c = Catalog(home)  # runs recovery again
+    assert sorted(t["name"] for t in c.list_tables()) == ["shop.extra", "shop.orders"]
+    assert c.query("select count(*) as n from shop.extra")["n"][0] == 1
+    c.close()
+    assert not (home / ".restore-journal.json").exists() and not list(home.glob(".restore-stage-*"))
+    assert not list(home.glob(".restore-replaced-*"))
+
+
+def test_a_rolled_back_journal_is_cleanup_only_it_never_replays_the_moves(cat, home, tmp_path):
+    """The P1 of round 3: old files are back in place, the journal still lists the (reversed) moves. If recovery read
+    those as forward moves it would carry the restored old catalog back into the staging directory."""
+    import subprocess
+    import sys
+
+    from resink_catalog.restore_journal import read_journal
+
+    _killed_restore(cat, home, tmp_path)
+    subprocess.run([sys.executable, "-c", RECOVERY_CRASH, str(home), "rolled-back-marker-after"], capture_output=True)
+    j = read_journal(home)
+    assert j["state"] == "rolled_back" and any(m[1].endswith("catalog.db") for m in j["moves"])
+    assert (home / "catalog.db").exists() and (home / "warehouse").is_dir()  # the old catalog is in place
+    shutil_stage = list(home.glob(".restore-stage-*"))
+    assert shutil_stage  # staging still there: that is exactly the state in which a replay would hurt
+    from resink_catalog.restore_journal import recover
+
+    assert recover(home) == "rolled back"
+    assert (home / "catalog.db").exists() and (home / "warehouse").is_dir()
+    assert sorted(t["name"] for t in Catalog(home).list_tables()) == ["shop.extra", "shop.orders"]
+
+
+def test_a_failed_recovery_keeps_its_journal_and_restore_does_not_delete_it(cat, home, tmp_path, monkeypatch):
+    from resink_catalog import restore_journal as rj
+
+    _killed_restore(cat, home, tmp_path)
+    bk = tmp_path / "bk2"
+    shutil_home = home  # a second backup of the same location, to call restore with
+    assert (home / ".restore-journal.json").exists()
+    before = (home / ".restore-journal.json").read_text()
+    real = rj.durable_rename
+
+    def failing(a, b):
+        raise OSError("I/O error during rollback")
+
+    monkeypatch.setattr(rj, "durable_rename", failing)
+    with pytest.raises(OSError, match="I/O error"):
+        restore(tmp_path / "bk", shutil_home, replace=True)  # its initial recover() fails
+    assert (home / ".restore-journal.json").read_text() == before  # the instructions were not thrown away
+    with pytest.raises(OSError, match="I/O error"):
+        Catalog(home)  # nor by a normal start
+    assert (home / ".restore-journal.json").exists()
+    monkeypatch.setattr(rj, "durable_rename", real)
+    assert sorted(t["name"] for t in Catalog(home).list_tables()) == ["shop.extra", "shop.orders"]  # and it recovers
+    del bk
+
+
+def test_a_failing_rollback_inside_restore_keeps_the_journal(cat, home, tmp_path, monkeypatch):
+    """The swap fails (final check), and then the undo itself fails: the journal must stay for the next start."""
+    from resink_catalog import backup as backup_module
+    from resink_catalog import restore_journal as rj
+
+    bk = tmp_path / "bk"
+    backup(home, bk)
+    cat.write_table("shop.extra", pd.DataFrame({"x": [1]}))
+    cat.close()
+    monkeypatch.setattr(backup_module, "referenced_files", lambda c: [home / "warehouse" / "nope"])  # final check fails
+    real = rj.durable_rename
+    state = {"n": 0}
+
+    def flaky(a, b):
+        state["n"] += 1
+        if state["n"] > 1:  # the forward renames use backup.py's own reference; the 2nd undo rename fails
+            raise OSError("disk went away")
+        real(a, b)
+
+    monkeypatch.setattr(rj, "durable_rename", flaky)
+    with pytest.raises(OSError, match="disk went away"):
+        restore(bk, home, replace=True)
+    assert (home / ".restore-journal.json").exists()
+    monkeypatch.undo()
+    assert sorted(t["name"] for t in Catalog(home).list_tables()) == ["shop.extra", "shop.orders"]
+
+
+def test_the_durability_order_staged_data_then_journal_then_renames_with_both_parents_then_marker(
+    cat, home, tmp_path, monkeypatch
+):
+    from resink_catalog import backup as backup_module
+    from resink_catalog import restore_journal as rj
+
+    bk = tmp_path / "bk"
+    backup(home, bk)
+    cat.close()
+    events = []
+    for name in ("fsync_tree", "fsync_dir"):
+        real = getattr(rj, name)
+        monkeypatch.setattr(rj, name, lambda *a, _r=real, _n=name: (events.append((_n, Path(a[0]).name)), _r(*a))[1])
+    real_rename, real_write = rj.durable_rename, rj.write_journal
+    monkeypatch.setattr(
+        rj, "durable_rename", lambda a, b: (events.append(("rename", a.name, b.name)), real_rename(a, b))[1]
+    )
+    monkeypatch.setattr(rj, "write_journal", lambda h, d: (events.append(("journal", d["state"])), real_write(h, d))[1])
+    monkeypatch.setattr(backup_module, "fsync_tree", rj.fsync_tree)
+    monkeypatch.setattr(backup_module, "fsync_dir", rj.fsync_dir)
+    monkeypatch.setattr(backup_module, "write_journal", rj.write_journal)
+    monkeypatch.setattr(backup_module, "durable_rename", rj.durable_rename)
+    restore(bk, home, replace=True)
+    kinds = [e[0] for e in events]
+    first_journal = kinds.index("journal")
+    assert kinds.index("fsync_tree") < first_journal and events[first_journal] == ("journal", "swapping")
+    renames = [i for i, e in enumerate(events) if e[0] == "rename"]
+    assert len(renames) == 4 and renames[0] > first_journal  # no rename before the journal is durable
+    assert events[kinds.index("journal", first_journal + 1)] == ("journal", "committed")
+    assert kinds.index("journal", first_journal + 1) > renames[-1]  # the marker comes after every rename
+    # each rename is followed by an fsync of its parent directory (both, when they differ) before the next step
+    for i in renames:
+        assert events[i + 1][0] == "fsync_dir"
+    assert not list(home.glob(".restore-journal.json"))  # removed last
