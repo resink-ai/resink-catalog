@@ -587,3 +587,44 @@ def test_the_durability_order_staged_data_then_journal_then_renames_with_both_pa
     for i in renames:
         assert events[i + 1][0] == "fsync_dir"
     assert not list(home.glob(".restore-journal.json"))  # removed last
+
+
+# ------------------------------------------------------------------------------------------ round 4 (TASK-14)
+
+
+def test_an_uncertain_commit_marker_is_never_rolled_back_in_process(cat, home, tmp_path, monkeypatch):
+    """The marker replaces the journal with `committed`, then the directory fsync fails. Our own record still said
+    `swapping`; the old code started an undo under a journal that already said `committed`. Now nothing is undone
+    here: the journal stays, the restored catalog stays, and recovery decides from the disk."""
+    import subprocess
+    import sys
+
+    from resink_catalog import backup as backup_module
+    from resink_catalog.restore_journal import read_journal
+
+    bk = tmp_path / "bk"
+    backup(home, bk)
+    cat.write_table("shop.extra", pd.DataFrame({"x": [1]}))  # the live catalog differs from the backup
+    cat.close()
+    real = backup_module.write_journal
+
+    def replace_then_fail(h, data):
+        real(h, data)  # the journal is replaced durably...
+        if data["state"] == "committed":
+            raise OSError("fsync of the directory failed")  # ...and then the call reports an error
+
+    monkeypatch.setattr(backup_module, "write_journal", replace_then_fail)
+    with pytest.raises(OSError, match="fsync of the directory failed"):
+        restore(bk, home, replace=True)
+    monkeypatch.undo()
+    assert read_journal(home)["state"] == "committed"  # kept, and no undo was started
+    assert list(home.glob(".restore-stage-*")) and (home / "catalog.db").exists()
+    # a recovery that is itself interrupted part-way through its cleanup, then the next start
+    proc = subprocess.run([sys.executable, "-c", RECOVERY_CRASH, str(home), "cleanup-after-stage"], capture_output=True)
+    assert proc.returncode == 9
+    c = Catalog(home)
+    assert [t["name"] for t in c.list_tables()] == ["shop.orders"]  # complete: the restored catalog
+    assert c.query("select count(*) as n from shop.orders")["n"][0] == 4
+    c.close()
+    assert not (home / ".restore-journal.json").exists() and not list(home.glob(".restore-stage-*"))
+    assert list(home.glob(".restore-replaced-*/catalog.db"))  # the old catalog is kept, as for any committed restore

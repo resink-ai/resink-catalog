@@ -27,7 +27,7 @@ from urllib.request import url2pathname
 from .catalog import Catalog
 from .home import SCHEMA_VERSION
 from .lock import CatalogInUse, CatalogLock
-from .restore_journal import cleanup, durable_rename, fsync_dir, fsync_tree, recover, rollback, write_journal
+from .restore_journal import JOURNAL, cleanup, durable_rename, fsync_dir, fsync_tree, recover, rollback, write_journal
 
 BACKUP_FORMAT = 1
 MANIFEST = "manifest.json"
@@ -276,6 +276,10 @@ def _swap_in(src: Path, home: Path, manifest: dict) -> dict:
         if missing:
             raise BackupError(f"restored catalog references {len(missing)} missing file(s), for example {missing[0]}")
         committed = {**journal, "state": "committed"}
+        # From here the outcome is uncertain: the marker may be on disk even if this call raises (for example when the
+        # directory fsync after the replace fails). Drop our own record so the handler never undoes moves in-process;
+        # the journal stays and the next start decides from what is on disk (`committed` completes, `swapping` undoes).
+        journal = None
         _commit_marker(home, committed)  # the swap renames are durable (fsynced parents) before this marker is
         journal = committed
         had_old = any(replaced.iterdir())
@@ -284,7 +288,7 @@ def _swap_in(src: Path, home: Path, manifest: dict) -> dict:
     except BaseException:
         if journal is not None and journal["state"] == "swapping":
             rollback(home, journal)  # durable; if it raises, the journal stays for the next start
-        elif journal is None:  # failed while staging: nothing was moved and no journal exists
+        elif journal is None and not (home / JOURNAL).exists():  # failed while staging: nothing moved, no journal
             shutil.rmtree(stage, ignore_errors=True)
             try:
                 replaced.rmdir()
