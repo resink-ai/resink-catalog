@@ -4,9 +4,17 @@ info:
   version: 0.1.0
   summary: Local Catalog to Resink cloud, Iceberg snapshots only, one-way.
   description: |
-    Contract for push protocol v0. Design: teams/application/catalog/specs/2026-11-13-push-protocol.md in the newbase repo.
-    This file is the source of truth.
-    The prose and this file must agree; this file wins.
+    Contract for push protocol v0. Design: teams/application/catalog/specs/2026-11-13-push-protocol.md in the newbase repo
+    (sections 4 to 8 as revised for plan v2.3). The prose and this file must agree; this file wins.
+    v0 has no released consumer, so it is revised in place until the first Local Catalog release with push.
+
+    Conventions that hold for every `/push/v0` operation:
+    - Request objects are closed (`additionalProperties: false`): an unknown field is `400 invalid_request`.
+    - Ownership: a session belongs to the device and org that created it. Any call on a session from another device,
+      for an unknown `push_id`, answers `404 not_found`, so a guessed id reveals nothing. `GET /table-state` answers
+      only for workspaces of the token's org and returns `404 not_found` for any other workspace.
+    - Admission (design section 6) runs when a session is created and again at commit. A stale feed gives
+      `503 unavailable` with `Retry-After`; reads keep working.
 
     Two services appear here. The device sign-in paths (tag `device-signin`) belong to accounts.
     The `/push/v0` paths (tag `push`) belong to the push receiver in resink-platform.
@@ -87,11 +95,16 @@ paths:
       tags: [device-signin]
       operationId: deviceRevoke
       summary: Revoke this device (used by `logout`).
+      description: |
+        Accounts adds the device to the revoked list (`GET /v1/devices/revoked?changed_since=`) and stops issuing it
+        access tokens. The push receiver polls that list and refuses the device's still unexpired access token with
+        `403 forbidden` within the poll interval (5 minutes), at the latest when the token expires (15 minutes).
+        Revocation is therefore not instant: after it, at most one publication already sent to the catalog can still land.
       servers:
         - url: https://accounts.resink.ai
       responses:
         '204':
-          description: Revoked. Access tokens already issued stay valid until `exp`.
+          description: Revoked. The receiver refuses this device's tokens within the revoked-list poll interval.
         '401':
           $ref: '#/components/responses/Problem'
   /push/v0/capabilities:
@@ -106,11 +119,17 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Capabilities'}
         '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Unavailable'}
   /push/v0/table-state:
     get:
       tags: [push]
       operationId: getTableState
       summary: What the cloud holds for a target table. The cloud is the truth about what was pushed.
+      description: |
+        Answers only for workspaces of the token's org. For any other workspace the answer is `404 not_found`,
+        the same as for a workspace that does not exist, so table names cannot be enumerated across orgs.
+        A read: it keeps working while a feed is stale or the workspace is paused.
       parameters:
         - {name: workspace_id, in: query, required: true, schema: {type: string}}
         - name: namespace
@@ -128,12 +147,19 @@ paths:
               schema: {$ref: '#/components/schemas/TableState'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
-        '423': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Unavailable'}
   /push/v0/pushes:
     post:
       tags: [push]
       operationId: createPush
-      summary: Open a push session for one table. Checks quota and hold before accepting.
+      summary: Open a push session for one table. Runs admission (design section 6) before accepting.
+      description: |
+        Checks, in order: device JWT and revocation, role, that `target_workspace_id` is a managed workspace of the
+        token's org (`403 forbidden` otherwise), workspace status (`423 workspace_paused`), storage ceilings
+        (`413 storage_ceiling`), open sessions and staging (`409 push_in_progress`, `429 staging_full`). Above the
+        org's included storage the push is accepted as `over_included` and the response carries the estimated cost;
+        the client asks the user to confirm before uploading. Storage for the declared files is reserved atomically.
       parameters:
         - {$ref: '#/components/parameters/IdempotencyKey'}
       requestBody:
@@ -148,23 +174,32 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/NothingToPush'}
         '201':
-          description: Session opened. `files` lists what must be uploaded.
+          description: Session opened. `files` lists what must be uploaded; `admission` says how it was accepted.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/PushSession'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
-        '402':
-          description: Over quota and the org hold is exhausted. Code `quota_exceeded`. Over quota with credits left is accepted and billed.
+        '403': {$ref: '#/components/responses/Problem'}
+        '409':
+          description: >-
+            `push_in_progress` (another session for this table, or too many open sessions; carries `push_id`),
+            `idempotency_conflict`, `history_diverged`, `schema_conflict` or `table_exists`.
           content:
             application/problem+json:
-              schema: {$ref: '#/components/schemas/QuotaProblem'}
-        '403': {$ref: '#/components/responses/Problem'}
-        '409': {$ref: '#/components/responses/Problem'}
+              schema: {$ref: '#/components/schemas/Problem'}
+        '413':
+          description: '`storage_ceiling` (org or workspace; see `StorageCeilingProblem`) or `file_too_large`.'
+          content:
+            application/problem+json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/StorageCeilingProblem'
+                  - $ref: '#/components/schemas/Problem'
         '422': {$ref: '#/components/responses/Problem'}
-        '423': {$ref: '#/components/responses/Problem'}
-        '429': {$ref: '#/components/responses/Problem'}
-        '503': {$ref: '#/components/responses/Problem'}
+        '423': {$ref: '#/components/responses/WorkspacePaused'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
   /push/v0/pushes/{push_id}:
     parameters:
       - {$ref: '#/components/parameters/PushId'}
@@ -172,6 +207,7 @@ paths:
       tags: [push]
       operationId: getPush
       summary: Session state and, per file, how many bytes the server has. Used to resume.
+      description: A session of another device, or an unknown `push_id`, answers `404 not_found`.
       responses:
         '200':
           description: Session.
@@ -179,17 +215,22 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/PushSession'}
         '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
         '410': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Unavailable'}
     delete:
       tags: [push]
       operationId: abortPush
       summary: Abort a session. Completed staged files are kept until their TTL.
+      description: A session of another device, or an unknown `push_id`, answers `404 not_found`.
       responses:
-        '204': {description: Aborted.}
+        '204': {description: Aborted. The unused reservation is released; staged bytes stay counted until GC deletes them.}
         '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Unavailable'}
   /push/v0/pushes/{push_id}/files/{file_id}:
     parameters:
       - {$ref: '#/components/parameters/PushId'}
@@ -198,6 +239,10 @@ paths:
       tags: [push]
       operationId: uploadFileChunk
       summary: Append one chunk to a file. The chunk must start at the server's `received_bytes`.
+      description: |
+        A chunk must lie inside the size declared for the file when the session was created; one that would exceed it
+        is rejected with `400 invalid_request` before anything is written. A session of another device, or an
+        unknown `push_id`, answers `404 not_found`.
       parameters:
         - name: Content-Range
           in: header
@@ -217,6 +262,7 @@ paths:
               schema: {$ref: '#/components/schemas/FileStatus'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
         '409':
           description: Code `offset_mismatch`; the body carries `received_bytes`.
@@ -225,16 +271,35 @@ paths:
               schema: {$ref: '#/components/schemas/Problem'}
         '410': {$ref: '#/components/responses/Problem'}
         '413': {$ref: '#/components/responses/Problem'}
-        '422': {$ref: '#/components/responses/Problem'}
-        '429': {$ref: '#/components/responses/Problem'}
-        '503': {$ref: '#/components/responses/Problem'}
+        '422':
+          description: '`checksum_mismatch` (the file restarts from 0) or `invalid_parquet`.'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
   /push/v0/pushes/{push_id}/commit:
     parameters:
       - {$ref: '#/components/parameters/PushId'}
     post:
       tags: [push]
       operationId: commitPush
-      summary: Verify files, re-check quota and replay the snapshots. Idempotent.
+      summary: Verify files, run admission again and replay the snapshots one at a time. Idempotent.
+      description: |
+        Snapshots commit in order, each through the receiver's commit journal, so a crash neither duplicates nor skips
+        one. Admission is checked again between snapshots: if the workspace was paused, the device revoked or a feed
+        went stale, the commit stops after the snapshot in flight and the session ends `failed` with
+        `committed_through` set to the last source snapshot that is committed. The client starts a new push to resume.
+        A session of another device, or an unknown `push_id`, answers `404 not_found`.
+
+        If the session's `admission.outcome` is `over_included`, the body must carry `confirm_over_included: true`.
+        Without it the commit is refused with `409 confirmation_required`, whose detail names the estimated monthly
+        cost, so a buggy or old client can never incur charges silently. The body is optional otherwise.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CommitRequest'}
       responses:
         '200':
           description: Already committed; the result.
@@ -247,17 +312,25 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/PushSession'}
         '401': {$ref: '#/components/responses/Problem'}
-        '402':
-          description: The re-check at commit found the push over quota with an exhausted hold.
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409':
+          description: >-
+            `confirmation_required` (the session was accepted as `over_included` and the request lacks
+            `confirm_over_included: true`; carries `estimated_extra_monthly_cost`), or a state conflict such as
+            `history_diverged`.
           content:
             application/problem+json:
-              schema: {$ref: '#/components/schemas/QuotaProblem'}
-        '404': {$ref: '#/components/responses/Problem'}
-        '409': {$ref: '#/components/responses/Problem'}
+              schema: {$ref: '#/components/schemas/Problem'}
         '410': {$ref: '#/components/responses/Problem'}
+        '413':
+          description: The re-check at commit found a ceiling exceeded (it was lowered meanwhile). Code `storage_ceiling`.
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/StorageCeilingProblem'}
         '422': {$ref: '#/components/responses/Problem'}
-        '423': {$ref: '#/components/responses/Problem'}
-        '503': {$ref: '#/components/responses/Problem'}
+        '423': {$ref: '#/components/responses/WorkspacePaused'}
+        '503': {$ref: '#/components/responses/Unavailable'}
 components:
   securitySchemes:
     deviceJwt:
@@ -269,7 +342,9 @@ components:
         Claims follow rp_contracts TokenClaims: `sub` (device id), `org_id`, `workspace_id`
         (the `local` workspace), `role`, `principal_type` = `device`, `iss`, `aud`, `exp`.
         There is no scope claim: the role matrix limits a device to `workspace:read` and `push`.
-        The receiver also refuses devices on the revoked list (`GET /v1/devices/revoked`, accounts).
+        The receiver also refuses devices on the revoked list (`GET /v1/devices/revoked?changed_since=`, accounts)
+        with `403 forbidden`: within the poll interval of the revocation (5 minutes), at the latest when the token
+        expires (15 minutes). `401 unauthenticated` is for a missing, expired or invalid token.
   parameters:
     IdempotencyKey:
       name: Idempotency-Key
@@ -288,9 +363,37 @@ components:
       required: true
       description: Lower-case hex SHA-256 of the file bytes.
       schema: {$ref: '#/components/schemas/FileId'}
+  headers:
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      required: true
+      schema: {type: integer, minimum: 0}
   responses:
     Problem:
       description: Problem document. See `code` for the specific error (design section 8).
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    WorkspacePaused:
+      description: >-
+        `workspace_paused`: the workspace is paused for `billing` or `admin`, or the org's hold is exhausted before
+        the pause arrives. `pause_reason` says which. Data stays readable for export.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    RateLimited:
+      description: '`rate_limited`, or `staging_full` when the org''s staged bytes are at their limit.'
+      headers:
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unavailable:
+      description: >-
+        `unavailable`: Gravitino, storage or a dependency is down, or a pulled feed (workspaces, revoked devices,
+        holds) is stale or has not completed its first sync. The receiver fails closed. Safe to retry.
+      headers:
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
@@ -304,7 +407,9 @@ components:
         - invalid_request
         - unauthenticated
         - forbidden
-        - quota_exceeded
+        - storage_ceiling
+        - staging_full
+        - confirmation_required
         - not_found
         - push_in_progress
         - offset_mismatch
@@ -329,9 +434,12 @@ components:
         status: {type: integer}
         code: {$ref: '#/components/schemas/ErrorCode'}
         detail: {type: string}
+        instance: {type: string, format: uri-reference}
         push_id: {type: string, description: 'Set on push_in_progress.'}
         received_bytes: {type: integer, format: int64, description: 'Set on offset_mismatch.'}
         feature: {type: string, description: 'Set on unsupported_table_feature.'}
+        estimated_extra_monthly_cost:
+          $ref: '#/components/schemas/Money'
         pause_reason: {type: string, enum: [billing, admin], description: 'Set on workspace_paused.'}
         resolution:
           type: array
@@ -341,25 +449,29 @@ components:
       type: object
       required: [action]
       properties:
-        action: {type: string, enum: [buy_credits, free_space, raise_quota, contact_admin, retry_later, use_new_table_name]}
+        action: {type: string, enum: [buy_credits, free_space, raise_limit, contact_admin, retry_later, use_new_table_name]}
         url: {type: string, format: uri}
         detail: {type: string}
-    QuotaProblem:
+    StorageCeilingProblem:
+      description: Refusal because the push would exceed the org's or the workspace's storage ceiling (design section 6).
       allOf:
         - $ref: '#/components/schemas/Problem'
         - type: object
-          required: [quota_bytes, used_bytes, incoming_bytes, hold_status]
+          required: [ceiling_bytes, used_bytes, reserved_bytes, incoming_bytes]
           properties:
-            code: {const: quota_exceeded}
-            quota_bytes: {type: integer, format: int64}
-            used_bytes: {type: integer, format: int64}
+            code: {const: storage_ceiling}
+            limit_scope: {type: string, enum: [org, workspace], description: Which ceiling was hit.}
+            ceiling_bytes: {type: integer, format: int64}
+            used_bytes: {type: integer, format: int64, description: committed + staged.}
+            reserved_bytes: {type: integer, format: int64}
             incoming_bytes: {type: integer, format: int64}
-            hold_status: {$ref: '#/components/schemas/HoldStatus'}
     HoldStatus:
       type: string
-      enum: [ok, low, exhausted]
+      description: An exhausted hold refuses the push (`workspace_paused`), so a session only ever sees `ok` or `low`.
+      enum: [ok, low]
     AuthorizationCodeGrant:
       type: object
+      additionalProperties: false
       required: [grant_type, code, code_verifier, redirect_uri, client_id]
       properties:
         grant_type: {type: string, const: authorization_code}
@@ -369,6 +481,7 @@ components:
         redirect_uri: {type: string, format: uri}
     RefreshGrant:
       type: object
+      additionalProperties: false
       required: [grant_type, refresh_token, client_id]
       properties:
         grant_type: {type: string, const: refresh_token}
@@ -404,10 +517,11 @@ components:
         chunk_bytes_max: {type: integer}
         session_ttl_seconds: {type: integer}
         staged_file_ttl_seconds: {type: integer}
-        max_snapshots_per_push: {type: integer}
-        max_files_per_push: {type: integer}
+        max_snapshots_per_push: {type: integer, description: Proposal 100.}
+        max_files_per_push: {type: integer, description: Proposal 10000.}
     TableRef:
       type: object
+      additionalProperties: false
       required: [namespace, name]
       properties:
         namespace: {type: array, items: {type: string}, minItems: 1}
@@ -426,6 +540,7 @@ components:
         last_pushed_at: {type: [string, 'null'], format: date-time}
     FileRef:
       type: object
+      additionalProperties: false
       required: [file_id, size_bytes, record_count, format]
       properties:
         file_id: {$ref: '#/components/schemas/FileId'}
@@ -434,6 +549,7 @@ components:
         format: {type: string, const: PARQUET}
     SnapshotDelta:
       type: object
+      additionalProperties: false
       required: [snapshot_id, sequence_number, timestamp_ms, operation, schema, added_files, removed_file_ids]
       properties:
         snapshot_id: {type: integer, format: int64}
@@ -443,18 +559,83 @@ components:
         operation: {type: string, enum: [append, overwrite, delete, replace]}
         summary:
           type: object
+          description: Iceberg snapshot summary, a map of string to string (an open map by definition).
           additionalProperties: {type: string}
-        schema:
-          type: object
-          description: Iceberg schema JSON at this snapshot, with field ids.
+        schema: {$ref: '#/components/schemas/IcebergSchema'}
         added_files:
           type: array
           items: {$ref: '#/components/schemas/FileRef'}
         removed_file_ids:
           type: array
           items: {$ref: '#/components/schemas/FileId'}
+    CommitRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        confirm_over_included:
+          type: boolean
+          description: Required to be true when the session's admission outcome is `over_included`. The user confirmed the extra monthly cost.
+    IcebergSchema:
+      type: object
+      additionalProperties: false
+      description: Iceberg schema JSON at one snapshot, field ids preserved. Anything else is `400 invalid_request`.
+      required: [type, fields]
+      properties:
+        type: {type: string, const: struct}
+        schema-id: {type: integer}
+        identifier-field-ids: {type: array, items: {type: integer}}
+        fields:
+          type: array
+          items: {$ref: '#/components/schemas/IcebergField'}
+    IcebergField:
+      type: object
+      additionalProperties: false
+      required: [id, name, required, type]
+      properties:
+        id: {type: integer}
+        name: {type: string, minLength: 1}
+        required: {type: boolean}
+        type: {$ref: '#/components/schemas/IcebergType'}
+        doc: {type: string}
+    IcebergType:
+      description: A primitive type name (for example `long`, `decimal(10,2)`) or a nested struct, list or map.
+      oneOf:
+        - {type: string, minLength: 1}
+        - $ref: '#/components/schemas/IcebergStruct'
+        - $ref: '#/components/schemas/IcebergList'
+        - $ref: '#/components/schemas/IcebergMap'
+    IcebergStruct:
+      type: object
+      additionalProperties: false
+      required: [type, fields]
+      properties:
+        type: {type: string, const: struct}
+        fields:
+          type: array
+          items: {$ref: '#/components/schemas/IcebergField'}
+    IcebergList:
+      type: object
+      additionalProperties: false
+      required: [type, element-id, element, element-required]
+      properties:
+        type: {type: string, const: list}
+        element-id: {type: integer}
+        element: {$ref: '#/components/schemas/IcebergType'}
+        element-required: {type: boolean}
+    IcebergMap:
+      type: object
+      additionalProperties: false
+      required: [type, key-id, key, value-id, value, value-required]
+      properties:
+        type: {type: string, const: map}
+        key-id: {type: integer}
+        key: {$ref: '#/components/schemas/IcebergType'}
+        value-id: {type: integer}
+        value: {$ref: '#/components/schemas/IcebergType'}
+        value-required: {type: boolean}
     CreatePushRequest:
       type: object
+      additionalProperties: false
       required: [target_workspace_id, table, source_table_uuid, format_version, snapshots]
       properties:
         target_workspace_id: {type: string}
@@ -476,16 +657,46 @@ components:
         state: {type: string, const: up_to_date}
         table: {$ref: '#/components/schemas/TableRef'}
         last_pushed_source_snapshot_id: {type: [integer, 'null'], format: int64}
-    QuotaDecision:
+    StorageUse:
       type: object
-      required: [outcome, quota_bytes, used_bytes, incoming_bytes, hold_status]
+      description: One org's or one workspace's counters in bytes (design section 6, storage accounting).
+      required: [ceiling_bytes, committed_bytes, staged_bytes, reserved_bytes]
       properties:
-        outcome: {type: string, enum: [allowed, allowed_over_quota]}
-        quota_bytes: {type: integer, format: int64}
-        used_bytes: {type: integer, format: int64}
+        ceiling_bytes: {type: integer, format: int64}
+        committed_bytes: {type: integer, format: int64}
+        staged_bytes: {type: integer, format: int64}
+        reserved_bytes: {type: integer, format: int64, description: Includes this session's reservation.}
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount: {type: string, pattern: '^[0-9]+(\.[0-9]+)?$', description: Decimal string.}
+        currency: {type: string, minLength: 3, maxLength: 3}
+    Admission:
+      type: object
+      description: How the session was accepted (design section 6, decision table, rows 6 and 7).
+      required: [outcome, incoming_bytes, org, workspace]
+      properties:
+        outcome:
+          type: string
+          enum: [accepted, over_included]
+          description: '`over_included`: the org total would exceed its included storage. The client shows `estimated_extra_monthly_cost` and asks the user to confirm before uploading.'
         incoming_bytes: {type: integer, format: int64}
+        org:
+          allOf:
+            - $ref: '#/components/schemas/StorageUse'
+            - type: object
+              properties:
+                included_bytes: {type: integer, format: int64, description: The plan's included storage, counted once per org.}
+        workspace: {$ref: '#/components/schemas/StorageUse'}
+        over_included_bytes: {type: integer, format: int64, description: Set with `over_included`.}
+        estimated_extra_monthly_cost:
+          $ref: '#/components/schemas/Money'
         hold_status: {$ref: '#/components/schemas/HoldStatus'}
-        notice: {type: string, description: Human readable, shown by the client for allowed_over_quota.}
+        warnings:
+          type: array
+          items: {type: string, enum: [hold_low]}
+          description: '`hold_low` when the org''s credits are running low.'
     FileStatus:
       type: object
       required: [file_id, size_bytes, state, received_bytes]
@@ -499,14 +710,14 @@ components:
           description: '`present` means the receiver already holds identical bytes; nothing to upload.'
     PushSession:
       type: object
-      required: [push_id, state, table, expires_at, quota, files]
+      required: [push_id, state, table, expires_at, admission, files]
       properties:
         push_id: {type: string}
         state: {type: string, enum: [open, committing, committed, failed, aborted, expired]}
         table: {$ref: '#/components/schemas/TableRef'}
         target_workspace_id: {type: string}
         expires_at: {type: string, format: date-time}
-        quota: {$ref: '#/components/schemas/QuotaDecision'}
+        admission: {$ref: '#/components/schemas/Admission'}
         files:
           type: array
           items: {$ref: '#/components/schemas/FileStatus'}
@@ -516,6 +727,10 @@ components:
           properties:
             snapshots_total: {type: integer}
             snapshots_committed: {type: integer}
+        committed_through:
+          type: [integer, 'null']
+          format: int64
+          description: On a `failed` session, the last source snapshot that is committed. The next push resumes after it.
         result: {$ref: '#/components/schemas/PushResult'}
         error: {$ref: '#/components/schemas/Problem'}
     PushResult:
