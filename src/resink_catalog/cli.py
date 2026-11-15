@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 import webbrowser
@@ -16,21 +17,60 @@ from . import __version__
 from .app import create_app
 from .catalog import Catalog, ImportErrorForUser
 from .home import default_home, ensure_home, init_db, load_or_create_token
+from .lock import CatalogInUse, CatalogLock
 
 DEFAULT_PORT = 8765
-HOST = "127.0.0.1"  # fixed on purpose: the catalog never listens on another interface
+HOST = "127.0.0.1"  # the address in every link; the catalog listens only here...
+CONTAINER_ENV = "RESINK_CATALOG_IN_CONTAINER"  # ...except inside the Docker image, see listen_host()
+
+
+def listen_host() -> str:
+    """127.0.0.1, always, except inside the Docker image (which sets RESINK_CATALOG_IN_CONTAINER=1): there the process
+    must listen on the container's interface, and the user keeps it private by publishing the port on the host's
+    127.0.0.1 only (`-p 127.0.0.1:8765:8765`). The token and the Host check apply either way."""
+    return "0.0.0.0" if os.environ.get(CONTAINER_ENV) == "1" else HOST  # noqa: S104
 
 
 def _bind(port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((HOST, port))
+    sock.bind((listen_host(), port))
     sock.listen(128)
     return sock
 
 
+def _hold_catalog(home: Path) -> CatalogLock:
+    """The lock `serve` keeps for its whole life. At start it first tries for the exclusive lock: when nobody else has
+    the catalog open, it finishes an interrupted restore, removes leftovers of interrupted imports, and only then
+    downgrades to shared (without a gap)."""
+    from .maintenance import remove_orphans
+    from .restore_journal import recover
+
+    try:
+        hold = CatalogLock(home, exclusive=True)
+    except CatalogInUse:
+        try:
+            shared = CatalogLock(home)  # others have it open: no cleanup now
+            recover(home)  # but an interrupted restore is still finished or undone before anything opens catalog.db
+            return shared
+        except CatalogInUse:
+            raise SystemExit("error: the catalog is being restored; try again when it is done") from None
+    try:
+        recover(home)
+        init_db(home)
+        with Catalog(home, lock=False) as cat:
+            n = len(remove_orphans(cat))
+        if n:
+            print(f"removed {n} leftover file(s) of interrupted imports", file=sys.stderr, flush=True)
+    except Exception as e:  # housekeeping must never stop the server from starting
+        print(f"warning: startup cleanup skipped: {e}", file=sys.stderr, flush=True)
+    hold.downgrade()
+    return hold
+
+
 def serve(home: Path, port: int, open_browser: bool) -> None:  # noqa: PLR0913
     ensure_home(home)
+    hold = _hold_catalog(home)  # held for the life of the server, even while idle, so `restore` refuses
     init_db(home)
     token = load_or_create_token(home)
     sock = _bind(port)
@@ -41,7 +81,10 @@ def serve(home: Path, port: int, open_browser: bool) -> None:  # noqa: PLR0913
     if open_browser:
         webbrowser.open(url)
     config = uvicorn.Config(create_app(token, home), log_level="warning")
-    uvicorn.Server(config).run(sockets=[sock])
+    try:
+        uvicorn.Server(config).run(sockets=[sock])
+    finally:
+        hold.release()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,6 +105,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ki.add_argument("--codex", nargs="?", const="", metavar="DIR", help="for Codex (default ~/.codex/prompts)")
     ks.add_parser("config", help="print the MCP configuration for both tools")
+    b = sub.add_parser("backup", help="copy the catalog and every file it references to a new directory, consistently")
+    b.add_argument("dest", type=Path, help="a new or empty directory outside the catalog's own")
+    b.add_argument("--home", type=Path, default=None, help="data directory")
+    r = sub.add_parser("restore", help="restore a backup made by `backup` (to the location it was made from)")
+    r.add_argument("source", type=Path, help="the backup directory")
+    r.add_argument("--home", type=Path, default=None, help="data directory")
+    r.add_argument("--replace", action="store_true", help="move an existing catalog aside instead of refusing")
+    c = sub.add_parser("cleanup", help="remove files left behind by interrupted imports (older than --min-age-hours)")
+    c.add_argument("--home", type=Path, default=None, help="data directory")
+    c.add_argument("--min-age-hours", type=float, default=24, help="leave younger files alone (default 24)")
+    c.add_argument("--dry-run", action="store_true", help="only list the files")
     for name, help_ in (
         ("import", "import a file, or apply the proposal for a folder added with add-folder"),
         ("add-folder", "find data files in a folder and propose tables; imports nothing"),
@@ -180,6 +234,32 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         cat = Catalog(args.home or default_home())
         build_server(lambda: cat).run("stdio")  # stdout carries the protocol: nothing else may print to it
+        return 0
+    if args.command in ("backup", "restore"):
+        from .backup import BackupError, backup, restore
+
+        try:
+            if args.command == "backup":
+                m = backup(args.home or default_home(), args.dest)
+                print(f"backed up {len(m['files'])} files and catalog.db to {args.dest}")
+            else:
+                m = restore(args.source, args.home or default_home(), replace=args.replace)
+                print(f"restored {len(m['files'])} files and catalog.db to {args.home or default_home()}")
+        except BackupError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        return 0
+    if args.command == "cleanup":
+        from .maintenance import CleanupRefused, cleanup
+
+        try:
+            files = cleanup(args.home or default_home(), args.min_age_hours * 3600, args.dry_run)
+        except CleanupRefused as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        for f in files:
+            print(f"{'would remove' if args.dry_run else 'removed'} {f}")
+        print(f"{len(files)} file(s)")
         return 0
     if args.command == "serve":
         serve(args.home or default_home(), args.port, not args.no_browser)

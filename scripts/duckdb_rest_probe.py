@@ -24,7 +24,7 @@ TOKEN = "probe-token"
 
 def main(install: bool) -> None:
     con = duckdb.connect(config={"autoinstall_known_extensions": False, "autoload_known_extensions": False})
-    for ext in ("httpfs", "iceberg"):
+    for ext in ("httpfs", "avro", "iceberg"):
         if install:
             con.execute(f"INSTALL {ext}")
         con.execute(f"LOAD {ext}")

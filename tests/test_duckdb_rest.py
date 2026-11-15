@@ -2,12 +2,14 @@
 
 The extension and `httpfs` are downloaded by DuckDB on first use, so they are not a test dependency (D10): these
 tests never install anything and are skipped when the extensions are not already in DuckDB's extension directory.
-Install them once, by hand, with `uv run python scripts/duckdb_rest_probe.py --install`.
+Install them once, by hand, with `uv run python scripts/duckdb_rest_probe.py --install` (the release CI does it with
+`scripts/install_duckdb_extensions.py` and sets RESINK_CATALOG_REQUIRE_DUCKDB_EXTENSIONS=1, so a missing one fails).
 """
 
 import duckdb
 import pandas as pd
 import pytest
+from extension_policy import skip_or_fail
 
 from resink_catalog import Catalog
 
@@ -18,7 +20,7 @@ def _connect() -> duckdb.DuckDBPyConnection:
         try:
             con.execute(f"LOAD {ext}")
         except duckdb.Error:
-            pytest.skip(f"DuckDB extension {ext!r} is not installed (needs a one-time download; see module docstring)")
+            skip_or_fail(f"DuckDB extension {ext!r} is not installed (needs a one-time download; see module docstring)")
     return con
 
 

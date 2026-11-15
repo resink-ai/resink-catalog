@@ -2,9 +2,24 @@
 
 Local Catalog: turns data files on your computer (CSV, Parquet, exports) into queryable Iceberg tables, and can push them to Resink cloud. Free and open source (Apache-2.0).
 
-**Status: L3 (MCP and agent kit).** CSV and Parquet files become Iceberg tables; the catalog speaks Iceberg REST; you can query it with read-only SQL, browse, review and import from a web UI, and let your own AI (Claude Code, Codex) look at it over MCP and write notes and tags back. No push yet.
+**Status: L4 (release candidate).** CSV and Parquet files become Iceberg tables; the catalog speaks Iceberg REST; you can query it with read-only SQL, browse, review and import from a web UI, and let your own AI (Claude Code, Codex) look at it over MCP and write notes and tags back. No push yet.
 
-## Run
+## Install
+
+```bash
+uv tool install resink-catalog        # or: pipx install resink-catalog, pip install resink-catalog
+resink-catalog serve                  # http://127.0.0.1:8765, opens the browser
+```
+
+Python 3.10 or newer; macOS, Windows and Linux. With Docker, publish the port on your own machine only and mount your data:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -p 127.0.0.1:8765:8765 -v "$HOME/.resink-catalog:/data" -v "$HOME/exports:/exports:ro" ghcr.io/resink-ai/resink-catalog
+```
+
+`--user` makes the container run as you, so it can write to the directory you mount (without it the process is uid 10001 and only a Docker named volume works). The access link is on the first line of the log (`docker logs`). Inside the container the process listens on the container's interface (the image sets `RESINK_CATALOG_IN_CONTAINER=1`); the token and the `Host` check still apply, and the `127.0.0.1:` in the command keeps the port off your network. Do not publish it as `-p 8765:8765`.
+
+## Run from a source checkout
 
 ```bash
 uv sync
@@ -42,6 +57,25 @@ resink-catalog agent-kit install --claude --codex        # skills: data-intervie
 Seven tools: `list_tables`, `describe_table`, `sample_table`, `query_sql` (one read-only `SELECT`; everything else is refused), `list_sources`, `add_tags`, `write_note`. The AI cannot import, change or delete anything. Its tags and notes are stored with their author (`ai` or `user`), shown in the web UI under each table's *Notes and tags* tab marked `ai`, and you can delete any of them there. Transports: `resink-catalog mcp` on stdio, and `/mcp` on the local server behind the access token (`Authorization: Bearer <token>`). Tables are `namespace.table`; single-file imports go to the namespace `main`, so `main.t` or just `t`.
 
 `scripts/check_claude_code.sh` checks, by hand, that real Claude Code attaches (add `--ask` for a short real conversation). It is not part of the test run.
+
+## Back up and restore
+
+```bash
+resink-catalog backup ~/backups/catalog-2026-11-14      # a new or empty directory outside the catalog's own
+resink-catalog restore ~/backups/catalog-2026-11-14 [--replace]
+```
+
+`backup` takes the catalog's write lock (imports, REST commits and snapshot expiry wait for it), copies `catalog.db` with SQLite's online backup API, then copies exactly the files the catalog references (every snapshot's metadata, manifests and data files; leftovers of an interrupted import are skipped), and writes `manifest.json` with a SHA-256 per file last, so a directory without it is not a backup. The access token and push credentials are never included. `restore` first checks the manifest (only relative paths under `warehouse/`, no symbolic links, no duplicates) and every checksum, stages a full copy inside the catalog directory, and only then swaps it in with renames; if anything fails it renames the old catalog back. With `--replace` an existing `catalog.db` (and its `-wal`/`-shm` files) and `warehouse/` are moved into a new `.restore-replaced-*` directory inside the catalog directory (a fresh name every time), never deleted. Before it moves anything, restore writes a journal; if the process is killed or the machine loses power half-way, the next start of any command, `serve` or `mcp` finishes or undoes the swap before it opens the catalog. Each step is made durable (fsync of the staged files, of both directories around every rename, then the journal marker) before the next one starts, and a journal is only removed after its recovery completed. It refuses while any process has the catalog open (a running `serve` or `mcp`): stop them first. A backup restores only to the directory it was made from, because Iceberg metadata records absolute paths.
+
+Limit: Iceberg metadata records absolute paths, so a backup restores only to the directory it was made from (restoring elsewhere is refused with that explanation). Moving a catalog to another machine with a different home directory is not supported yet.
+
+## Cleanup of interrupted imports
+
+An import that is killed part-way leaves data files nothing references. `resink-catalog cleanup [--min-age-hours N] [--dry-run]` removes them, and `serve` does the same when it starts and nobody else has the catalog open. Cleanup takes the same exclusive lock as `restore`: while any process (a server, an MCP session, an import) has the catalog open it refuses, so it can never delete a file an import is about to commit, whatever the file's age, and `--min-age-hours 0` is safe. The age limit (default 24 hours) only protects data files that an external REST client wrote before the server restarted and commits afterwards.
+
+## Push credentials
+
+The push client (a later milestone) stores its device tokens in the macOS Keychain or the Windows Credential Manager, chosen explicitly (not whatever backend the `keyring` package happens to select). If none is usable, for example on Linux, it refuses. Setting `RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS=1` opts in to a file `~/.config/resink-catalog/credentials.json` with mode 0600 (`RESINK_CATALOG_CREDENTIALS_DIR` overrides the directory), with a warning in the log; this is not offered on Windows. Tokens are never written to `catalog.db`, and `backup` does not copy them. The local access token (`~/.resink-catalog/token`) is a different thing: it only protects your own local server.
 
 ## Import your files
 
@@ -107,7 +141,7 @@ INSERT INTO ice.shop.orders VALUES (4, 'd');
 
 Caveat: DuckDB `DELETE` and `UPDATE` write Iceberg delete files. They read back correctly everywhere, but push v0 refuses tables that have delete files, and `GET /api/v1/tables/{name}` reports `push_ready: false` with the blocker. Rewrite the table with the Python API or re-import the source to make it pushable again.
 
-The DuckDB tests skip themselves unless both extensions are already installed (D10: the test run never downloads anything). `uv run python scripts/duckdb_rest_probe.py [--install]` prints what works.
+The DuckDB tests skip themselves unless both extensions are already installed (D10: the test run never downloads anything). The release CI installs them first (`scripts/install_duckdb_extensions.py`) and sets `RESINK_CATALOG_REQUIRE_DUCKDB_EXTENSIONS=1`, which turns that skip into a failure. `uv run python scripts/duckdb_rest_probe.py [--install]` prints what works.
 
 ## Develop
 
@@ -119,4 +153,4 @@ uv run ruff check . && uv run ruff format --check .
 
 ## License
 
-Apache-2.0, see `LICENSE`.
+Apache-2.0, see `LICENSE`. Licences of everything we depend on: `THIRD_PARTY_LICENSES.md` (permissive only; a test keeps it current). Contributions: `CONTRIBUTING.md`.
