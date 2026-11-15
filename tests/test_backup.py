@@ -68,7 +68,9 @@ def test_restore_refuses_an_existing_catalog_unless_replace_and_then_moves_it_as
     cat.close()
     restore(tmp_path / "bk", home, replace=True)
     assert [t["name"] for t in Catalog(home).list_tables()] == ["shop.orders"]
-    assert list(home.glob("catalog.db.replaced-*")) and list(home.glob("warehouse.replaced-*"))  # nothing deleted
+    assert list(home.glob(".restore-replaced-*/catalog.db")) and list(
+        home.glob(".restore-replaced-*/warehouse")
+    )  # nothing deleted
 
 
 def test_a_damaged_or_incomplete_backup_is_refused_before_anything_is_changed(cat, home, tmp_path):
@@ -229,7 +231,7 @@ def test_a_restore_that_fails_in_the_middle_of_the_swap_puts_the_old_catalog_bac
     with pytest.raises(OSError, match="disk full"):
         restore(bk, home, replace=True)
     monkeypatch.undo()
-    assert _state(home) == before and not list(home.glob(".restore-*")) and not list(home.glob("*.replaced-*"))
+    assert _state(home) == before and not list(home.glob(".restore-*")) and not list(home.glob(".restore-replaced-*"))
     assert sorted(t["name"] for t in Catalog(home).list_tables()) == ["shop.extra", "shop.orders"]
 
 
@@ -259,7 +261,7 @@ def test_restore_refuses_while_the_catalog_is_open_and_handles_sqlite_sidecars(c
     (home / "catalog.db-wal").write_bytes(b"stale")  # a leftover of a crashed process
     restore(bk, home, replace=True)
     assert not (home / "catalog.db-wal").exists()
-    assert list(home.glob("catalog.db-wal.replaced-*"))
+    assert list(home.glob(".restore-replaced-*/catalog.db-wal"))
 
 
 def test_a_running_server_blocks_restore(cat, home, tmp_path):
@@ -283,3 +285,142 @@ def test_a_running_server_blocks_restore(cat, home, tmp_path):
         proc.terminate()
         proc.wait(10)
     restore(bk, home, replace=True)  # the server is gone: allowed
+
+
+# ------------------------------------------------------------------------------------------ round 2 (TASK-11)
+
+
+def test_restoring_an_empty_catalog_works(home, tmp_path):
+    Catalog(home).close()  # a catalog without any table: the manifest has no files
+    m = backup(home, tmp_path / "bk")
+    assert m["files"] == []
+    restore(tmp_path / "bk", home, replace=True)
+    assert Catalog(home).list_tables() == []
+
+
+def test_the_staged_database_is_checked_against_the_manifest_checksum_before_it_is_opened(
+    cat, home, tmp_path, monkeypatch
+):
+    from resink_catalog import backup as backup_module
+
+    bk = tmp_path / "bk"
+    backup(home, bk)
+    cat.close()
+    (bk / "catalog.db").write_bytes(b"not the database the manifest describes")  # changed after verification...
+    monkeypatch.setattr(backup_module, "verify_backup", lambda src: json.loads((bk / "manifest.json").read_text()))
+    before = _state(home)
+    with pytest.raises(BackupError, match="catalog.db does not match its checksum"):
+        restore(bk, home, replace=True)  # ...so staging itself must catch it
+    assert _state(home) == before and not list(home.glob(".restore-*"))
+
+
+def test_recovery_names_are_unique_so_two_replacements_in_one_second_keep_both_old_catalogs(cat, home, tmp_path):
+    bk = tmp_path / "bk"
+    backup(home, bk)
+    cat.close()
+    for i in range(2):  # no time stamp in the names: nothing to collide, whatever the clock says
+        c = Catalog(home)
+        c.add_tags("shop.orders", [f"generation-{i}"], source="user")
+        c.close()
+        restore(bk, home, replace=True)
+    dirs = sorted(home.glob(".restore-replaced-*"))
+    assert len(dirs) == 2 and all((d / "catalog.db").is_file() and (d / "warehouse").is_dir() for d in dirs)
+    tags = set()
+    for d in dirs:
+        with sqlite3.connect(d / "catalog.db") as c:
+            tags |= {r[0] for r in c.execute("SELECT tag FROM tags")}
+    assert {"generation-0", "generation-1"} <= tags  # the first old catalog was not overwritten by the second
+
+
+CRASH_SCRIPT = """
+import os, sys
+from pathlib import Path
+from resink_catalog import backup as b
+bk, home, point = sys.argv[1], sys.argv[2], sys.argv[3]
+count = {"n": 0}
+real = b._rename
+def rename(a, c):
+    count["n"] += 1
+    if point == f"before-rename-{count['n']}":
+        os._exit(9)          # killed: no rollback code runs
+    real(a, c)
+    if point == f"after-rename-{count['n']}":
+        os._exit(9)
+b._rename = rename
+real_marker = b._commit_marker
+def marker(h, j):
+    if point == "before-commit-marker":
+        os._exit(9)
+    real_marker(h, j)
+    if point == "after-commit-marker":
+        os._exit(9)
+b._commit_marker = marker
+b.restore(bk, home, replace=True)
+"""
+
+
+@pytest.mark.parametrize(
+    "point",
+    [f"{when}-rename-{n}" for n in (1, 2, 3, 4) for when in ("before", "after")]
+    + ["before-commit-marker", "after-commit-marker"],
+)
+def test_a_restore_killed_at_any_step_is_undone_or_finished_at_the_next_start(cat, home, tmp_path, point):
+    """A real process is killed with os._exit between the renames (no `except` block runs). The next Catalog() must find
+    either the old catalog or the restored one, never an empty or mixed one."""
+    import subprocess
+    import sys
+
+    bk = tmp_path / "bk"
+    backup(home, bk)
+    cat.write_table("shop.extra", pd.DataFrame({"x": [1]}))  # the live catalog differs from the backup
+    cat.close()
+    import gc
+
+    gc.collect()
+    proc = subprocess.run([sys.executable, "-c", CRASH_SCRIPT, str(bk), str(home), point], capture_output=True)
+    assert proc.returncode == 9, proc.stderr.decode()[-400:]
+    assert (home / ".restore-journal.json").exists()  # the journal was durable before the first rename
+    names = sorted(t["name"] for t in Catalog(home).list_tables())  # recovery runs inside Catalog()
+    if point == "after-commit-marker":
+        assert names == ["shop.orders"]  # the restore had been committed: finished
+    else:
+        assert names == ["shop.extra", "shop.orders"]  # undone: the old catalog, tables and data intact
+        c = Catalog(home)
+        assert c.query("select count(*) as n from shop.extra")["n"][0] == 1
+        c.close()
+    assert not (home / ".restore-journal.json").exists() and not list(home.glob(".restore-stage-*"))
+    assert point == "after-commit-marker" or not list(home.glob(".restore-replaced-*"))
+
+
+def test_recovery_is_idempotent_and_survives_being_killed_itself(cat, home, tmp_path):
+    from resink_catalog.restore_journal import recover
+
+    bk = tmp_path / "bk"
+    backup(home, bk)
+    cat.close()
+    import gc
+    import subprocess
+    import sys
+
+    gc.collect()
+    subprocess.run([sys.executable, "-c", CRASH_SCRIPT, str(bk), str(home), "after-rename-3"], capture_output=True)
+    assert recover(home) == "rolled back" and recover(home) is None  # second run: nothing to do
+    assert [t["name"] for t in Catalog(home).list_tables()] == ["shop.orders"]
+
+
+def test_a_journal_that_names_paths_outside_home_is_refused(home, tmp_path):
+    from resink_catalog.restore_journal import RestoreRecoveryError, recover, write_journal
+
+    home.mkdir(parents=True)
+    write_journal(
+        home,
+        {
+            "format": 1,
+            "state": "swapping",
+            "stage": str(home / ".s"),
+            "replaced": str(home / ".r"),
+            "moves": [[str(tmp_path / "victim"), str(home / "x")]],
+        },
+    )
+    with pytest.raises(RestoreRecoveryError, match="outside"):
+        recover(home)

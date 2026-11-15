@@ -17,6 +17,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+import tempfile
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -26,6 +27,7 @@ from urllib.request import url2pathname
 from .catalog import Catalog
 from .home import SCHEMA_VERSION
 from .lock import CatalogInUse, CatalogLock
+from .restore_journal import JOURNAL, finish, recover, undo, write_journal
 
 BACKUP_FORMAT = 1
 MANIFEST = "manifest.json"
@@ -186,7 +188,8 @@ def _rename(a: Path, b: Path) -> None:
 
 
 def _stage(src: Path, stage: Path, manifest: dict) -> None:
-    """Copy and re-check everything into `stage` (inside home, so the final renames stay on one filesystem)."""
+    """Copy and re-check everything into the existing, empty `stage` directory (inside home, so the final renames stay
+    on one filesystem)."""
     stage_root = stage.resolve()
     for e in manifest["files"]:
         rel = _safe_relpath(e["path"])
@@ -199,6 +202,10 @@ def _stage(src: Path, stage: Path, manifest: dict) -> None:
             raise BackupError(f"{rel} does not match its checksum; the backup is damaged")
     (stage / "warehouse").mkdir(exist_ok=True)
     shutil.copy2(src / "catalog.db", stage / "catalog.db")
+    if (
+        _sha256(stage / "catalog.db") != manifest["catalog_db_sha256"]
+    ):  # before SQLite opens it, before it is swapped in
+        raise BackupError("catalog.db does not match its checksum; the backup is damaged")
     with closing(sqlite3.connect(stage / "catalog.db")) as c:
         if c.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise BackupError("the restored catalog.db failed SQLite's integrity check")
@@ -215,8 +222,10 @@ def _stage(src: Path, stage: Path, manifest: dict) -> None:
 
 def restore(src: Path | str, home: Path | str, replace: bool = False) -> dict:
     """Restore the backup `src` into `home`. Refuses a home that already has a catalog unless `replace` is set, in which
-    case the old catalog.db (with its -wal/-shm/-journal files) and warehouse are moved aside, never deleted. Refuses
-    while any process has the catalog open. All-or-nothing: on any failure the previous state is put back."""
+    case the old catalog.db (with its -wal/-shm/-journal files) and warehouse are moved into a new
+    `.restore-replaced-*` directory, never deleted. Refuses while any process has the catalog open. All-or-nothing:
+    on a failure the previous state is put back, and if the process is killed the restore journal lets the next start
+    (see restore_journal.py) finish or undo it. The returned manifest has `moved_aside` (that directory or None)."""
     src, home = Path(src).resolve(), Path(home).resolve()
     manifest = verify_backup(src)
     if Path(manifest["home"]) != home:
@@ -234,33 +243,53 @@ def restore(src: Path | str, home: Path | str, replace: bool = False) -> dict:
             f"the catalog at {home} is open in another process (a running `serve` or `mcp`, or a command); "
             "stop it and run restore again"
         ) from None
-    sidecars = [home / f"catalog.db{x}" for x in ("-wal", "-shm", "-journal")]  # leftovers: nobody has it open
-    existing = [p for p in (home / "catalog.db", *sidecars, home / "warehouse") if p.exists()]
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    stage = home / f".restore-{stamp}"
-    done: list[tuple[Path, Path]] = []
+    stage = replaced = None
+    moves: list[list[str]] = []
     try:
+        recover(home)  # an earlier restore that was killed: undo or finish it first
+        if (home / "catalog.db").exists() and not replace:
+            raise BackupError(f"{home} already has a catalog; pass --replace to move it aside and restore")
+        sidecars = [home / f"catalog.db{x}" for x in ("-wal", "-shm", "-journal")]  # leftovers: nobody has it open
+        existing = [p for p in (home / "catalog.db", *sidecars, home / "warehouse") if p.exists()]
+        # exclusively created, never reused: mkdtemp fails rather than return a name that exists
+        stage = Path(tempfile.mkdtemp(prefix=".restore-stage-", dir=home))
+        replaced = Path(tempfile.mkdtemp(prefix=".restore-replaced-", dir=home))
         _stage(src, stage, manifest)  # nothing in `home` has changed yet
-        for p in existing:
-            aside = p.with_name(f"{p.name}.replaced-{stamp}")
-            _rename(p, aside)
-            done.append((p, aside))
-        for name in ("warehouse", "catalog.db"):
-            _rename(stage / name, home / name)
-            done.append((stage / name, home / name))
+        moves = [[str(p), str(replaced / p.name)] for p in existing]
+        moves += [[str(stage / name), str(home / name)] for name in ("warehouse", "catalog.db")]
+        journal = {"format": 1, "state": "swapping", "stage": str(stage), "replaced": str(replaced), "moves": moves}
+        write_journal(home, journal)  # durable BEFORE the first rename
+        for a, b in moves:
+            _rename(Path(a), Path(b))
         with closing(Catalog(home, lock=False)) as cat:  # we hold the exclusive lock ourselves
             missing = [str(f) for f in referenced_files(cat) if not f.is_file()]
         if missing:
             raise BackupError(f"restored catalog references {len(missing)} missing file(s), for example {missing[0]}")
+        journal["state"] = "committed"
+        _commit_marker(home, journal)
+        had_old = any(replaced.iterdir())
+        finish(home, journal, keep_replaced=had_old)
+        manifest["moved_aside"] = str(replaced) if had_old else None
     except BaseException:
-        for a, b in reversed(done):  # put the previous state back, newest rename first
+        if moves:
+            undo(moves)
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
+        if replaced is not None:
             try:
-                _rename(b, a)
-            except OSError:  # nothing more can be done; the moved-aside files are still there
+                replaced.rmdir()
+            except OSError:
                 pass
-        shutil.rmtree(stage, ignore_errors=True)
+        try:
+            (home / JOURNAL).unlink()
+        except FileNotFoundError:
+            pass
         raise
     finally:
         lock.release()
-    shutil.rmtree(stage, ignore_errors=True)
     return manifest
+
+
+def _commit_marker(home: Path, journal: dict) -> None:
+    """The last step of a restore; a test kills the process right before and after it."""
+    write_journal(home, journal)

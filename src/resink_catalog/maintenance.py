@@ -1,10 +1,14 @@
-"""Startup housekeeping: remove the leftovers of interrupted imports.
+"""Housekeeping: remove the leftovers of interrupted imports.
 
 An import writes its data files before the catalog commits them. If the process dies in between, the files stay in
-`warehouse/` and nothing references them. `remove_orphans` deletes warehouse files that no snapshot of any table
-references and that are older than `min_age_seconds` (default 24 hours): a file that young may belong to an import
-another process is running right now. Run at `serve` start and by `resink-catalog cleanup`.
-"""
+`warehouse/` and nothing references them.
+
+Safety does not come from file age. `cleanup` takes the catalog directory's EXCLUSIVE lock, the one `restore` takes:
+every process that can write (serve, mcp, an import, a REST client's server) holds it shared while it has the catalog
+open, so while we hold it exclusively nothing can be creating files, and an unreferenced file really is a leftover,
+whatever its age (`min_age_seconds=0` is therefore safe). If any process has the catalog open, cleanup refuses.
+`min_age_seconds` (default 24 h) is kept only for the one case no lock can cover: a REST client that wrote data files
+before the server stopped and commits them after it restarts."""
 
 from __future__ import annotations
 
@@ -14,6 +18,8 @@ from pathlib import Path
 
 from .backup import referenced_files
 from .catalog import Catalog
+from .lock import CatalogInUse, CatalogLock
+from .restore_journal import recover
 
 log = logging.getLogger(__name__)
 DEFAULT_MIN_AGE_SECONDS = 24 * 3600
@@ -37,3 +43,24 @@ def remove_orphans(cat: Catalog, min_age_seconds: float = DEFAULT_MIN_AGE_SECOND
     if orphans:
         log.info("%s %d unreferenced file(s) from interrupted imports", "found" if dry_run else "removed", len(orphans))
     return orphans
+
+
+class CleanupRefused(Exception):
+    """Some process has the catalog open, so cleanup cannot know that no import is running."""
+
+
+def cleanup(home: Path | str, min_age_seconds: float = DEFAULT_MIN_AGE_SECONDS, dry_run: bool = False) -> list[Path]:
+    home = Path(home)
+    try:
+        lock = CatalogLock(home, exclusive=True)
+    except CatalogInUse:
+        raise CleanupRefused(
+            f"the catalog at {home} is open in another process (a running `serve` or `mcp`, or an import); "
+            "stop it and run cleanup again"
+        ) from None
+    try:
+        recover(home)
+        with Catalog(home, lock=False) as cat:
+            return remove_orphans(cat, min_age_seconds, dry_run)
+    finally:
+        lock.release()

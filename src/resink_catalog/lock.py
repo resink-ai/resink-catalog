@@ -69,6 +69,21 @@ class CatalogLock:
             raise
         self._fd = fd
 
+    def downgrade(self) -> None:
+        """Exclusive to shared without a gap in which another process could take the lock (POSIX); on Windows the
+        exclusive lock is dropped and a shared one taken."""
+        if not self.exclusive:
+            return
+        if os.name == "posix" and self._fd is not None:
+            import fcntl
+
+            fcntl.flock(self._fd, fcntl.LOCK_SH)
+            self.exclusive = False
+            return
+        self.release()  # pragma: no cover
+        self.exclusive = False  # pragma: no cover
+        self._acquire()  # pragma: no cover
+
     def release(self) -> None:
         if self._fd is not None:
             os.close(self._fd)  # closing drops the flock / byte-range locks
@@ -85,3 +100,28 @@ class CatalogLock:
             self.release()
         except Exception:
             pass
+
+
+class recovery_guard:  # noqa: N801 - used as a context manager
+    """A blocking exclusive lock that serialises crash recovery between processes starting at the same moment."""
+
+    def __init__(self, home: Path):
+        self._path = Path(home) / ".restore-recovery.lock"
+        self._fd: int | None = None
+
+    def __enter__(self):
+        self._fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+        if os.name == "posix":
+            import fcntl
+
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        else:  # pragma: no cover - Windows runner only
+            import msvcrt
+
+            msvcrt.locking(self._fd, msvcrt.LK_LOCK, 1)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None

@@ -22,6 +22,7 @@ from .home import default_home, ensure_home, init_db
 from .lock import CatalogLock
 from .query import query_arrow, run_query
 from .readers import ReadError, apply_types, detect_format, file_hash, read_file, type_name
+from .restore_journal import recover as recover_interrupted_restore
 from .store import DEFAULT_NAMESPACE, open_iceberg, slug, split_name
 
 log = logging.getLogger(__name__)
@@ -72,17 +73,49 @@ def _group_key(path: Path) -> str:
 
 class Catalog:
     def __init__(self, home: Path | str | None = None, lock: bool = True):
+        self._closed = False
+        self._lock = None
+        self._iceberg = None
         self.home = ensure_home(Path(home) if home else default_home())
-        # shared with every other open catalog; `restore` needs it exclusive and so refuses while any is open
-        self._lock = CatalogLock(self.home) if lock else None
-        self.db_path = init_db(self.home)
-        self.iceberg = open_iceberg(self.home)
-        self.migrated = self._migrate_default_namespace()
+        try:
+            # shared with every other open catalog; `restore` needs it exclusive and so refuses while any is open
+            self._lock = CatalogLock(self.home) if lock else None
+            if lock:  # before anything opens catalog.db: finish or undo a restore that was killed half-way
+                recover_interrupted_restore(self.home)
+            self.db_path = init_db(self.home)
+            self._iceberg = open_iceberg(self.home)
+            self.migrated = self._migrate_default_namespace()
+        except BaseException:
+            self.close()  # never leave a pooled connection or the lock behind
+            raise
+
+    @property
+    def iceberg(self):
+        if self._closed:
+            raise ImportErrorForUser("this catalog is closed")
+        return self._iceberg
 
     def close(self) -> None:
-        """Release the catalog directory's lock (also released when the object is garbage collected)."""
-        if self._lock is not None:
-            self._lock.release()
+        """Close the Iceberg catalog's pooled SQLite connections first, then release the directory lock. Afterwards
+        every operation raises: a closed catalog must not touch files a restore may be about to move. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._iceberg is not None:
+                engine = getattr(self._iceberg, "engine", None)
+                if engine is not None:
+                    engine.dispose()
+                self._iceberg = None
+        finally:
+            if self._lock is not None:
+                self._lock.release()
+
+    def __enter__(self) -> Catalog:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def _migrate_default_namespace(self) -> list[str]:
         """Catalogs made before the rename have their tables in `default`: move them to `main` (nothing is released
@@ -352,6 +385,8 @@ class Catalog:
     # ----------------------------------------------------------------- sources
 
     def _conn(self) -> sqlite3.Connection:
+        if self._closed:
+            raise ImportErrorForUser("this catalog is closed")
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn

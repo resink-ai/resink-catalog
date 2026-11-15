@@ -9,7 +9,6 @@ import socket
 import sys
 import webbrowser
 from collections.abc import Sequence
-from contextlib import closing
 from pathlib import Path
 
 import uvicorn
@@ -40,26 +39,39 @@ def _bind(port: int) -> socket.socket:
     return sock
 
 
-def _startup_cleanup(home: Path) -> None:
+def _hold_catalog(home: Path) -> CatalogLock:
+    """The lock `serve` keeps for its whole life. At start it first tries for the exclusive lock: when nobody else has
+    the catalog open, it finishes an interrupted restore, removes leftovers of interrupted imports, and only then
+    downgrades to shared (without a gap)."""
     from .maintenance import remove_orphans
+    from .restore_journal import recover
 
     try:
-        with closing(Catalog(home)) as cat:
+        hold = CatalogLock(home, exclusive=True)
+    except CatalogInUse:
+        try:
+            shared = CatalogLock(home)  # others have it open: no cleanup now
+            recover(home)  # but an interrupted restore is still finished or undone before anything opens catalog.db
+            return shared
+        except CatalogInUse:
+            raise SystemExit("error: the catalog is being restored; try again when it is done") from None
+    try:
+        recover(home)
+        init_db(home)
+        with Catalog(home, lock=False) as cat:
             n = len(remove_orphans(cat))
         if n:
             print(f"removed {n} leftover file(s) of interrupted imports", file=sys.stderr, flush=True)
     except Exception as e:  # housekeeping must never stop the server from starting
         print(f"warning: startup cleanup skipped: {e}", file=sys.stderr, flush=True)
+    hold.downgrade()
+    return hold
 
 
 def serve(home: Path, port: int, open_browser: bool) -> None:  # noqa: PLR0913
     ensure_home(home)
-    try:
-        hold = CatalogLock(home)  # held for the life of the server, even while idle, so `restore` refuses
-    except CatalogInUse:  # pragma: no cover - a shared lock only fails while a restore holds it
-        raise SystemExit("error: the catalog is being restored; try again when it is done") from None
+    hold = _hold_catalog(home)  # held for the life of the server, even while idle, so `restore` refuses
     init_db(home)
-    _startup_cleanup(home)
     token = load_or_create_token(home)
     sock = _bind(port)
     actual_port = sock.getsockname()[1]
@@ -238,10 +250,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         return 0
     if args.command == "cleanup":
-        from .maintenance import remove_orphans
+        from .maintenance import CleanupRefused, cleanup
 
-        with closing(Catalog(args.home or default_home())) as cat:
-            files = remove_orphans(cat, args.min_age_hours * 3600, args.dry_run)
+        try:
+            files = cleanup(args.home or default_home(), args.min_age_hours * 3600, args.dry_run)
+        except CleanupRefused as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
         for f in files:
             print(f"{'would remove' if args.dry_run else 'removed'} {f}")
         print(f"{len(files)} file(s)")
