@@ -75,6 +75,9 @@ def read_csv(path: Path) -> pa.Table:
         raise ReadError(f"cannot read file: {e}") from e
     if not text.strip():
         raise ReadError("the file is empty")
+    # `\r\r\n` is what a CRLF file becomes after one more text-mode newline translation (Windows tools do this). No
+    # CSV means it, and DuckDB's sniffer fails on it for a file without data rows, so read it as the CRLF it was.
+    text = re.sub(r"\r{2,}\n", "\r\n", text)
     with tempfile.TemporaryDirectory() as tmp:
         utf8 = Path(tmp) / "data.csv"  # DuckDB reads UTF-8 only without extensions; transcode once
         utf8.write_text(text, encoding="utf-8", newline="")

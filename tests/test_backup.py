@@ -628,3 +628,30 @@ def test_an_uncertain_commit_marker_is_never_rolled_back_in_process(cat, home, t
     c.close()
     assert not (home / ".restore-journal.json").exists() and not list(home.glob(".restore-stage-*"))
     assert list(home.glob(".restore-replaced-*/catalog.db"))  # the old catalog is kept, as for any committed restore
+
+
+# ------------------------------------------------------------------ Windows locations (simulated: CI runs the real thing)
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("file:///C:/Users/x/warehouse/a/b.json", "C:/Users/x/warehouse/a/b.json"),  # what an old pyiceberg stored
+        ("C:\\Users\\x\\warehouse\\a\\b.json", "C:\\Users\\x\\warehouse\\a\\b.json"),  # plain drive path (Windows)
+        ("C:/Users/x/warehouse/a b.json", "C:/Users/x/warehouse/a b.json"),
+        ("file:///C:/Users/x/a%20b.json", "C:/Users/x/a b.json"),
+        ("file:///home/x/warehouse/a.json", "/home/x/warehouse/a.json"),
+        ("/home/x/warehouse/a.json", "/home/x/warehouse/a.json"),
+    ],
+)
+def test_local_path_reads_windows_and_posix_locations_alike(location, expected):
+    from resink_catalog.backup import _local_path
+
+    assert str(_local_path(location)).replace("\\", "/") == expected.replace("\\", "/")
+
+
+def test_local_path_refuses_remote_locations():
+    from resink_catalog.backup import BackupError, _local_path
+
+    with pytest.raises(BackupError):
+        _local_path("s3://bucket/key")
