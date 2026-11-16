@@ -281,3 +281,108 @@ def test_r3_later_calls_on_the_same_api_work_after_an_abandoned_one():
         with pytest.raises(RequestMaybeSent):
             api.request("GET", "/a")
         assert api.request("GET", "/b").json() == {"ok": True}
+
+
+# ---------------------------------------------------------------- round 4: cancellation during connect and TLS
+
+
+class _SlowConnect:
+    """httpcore's backend with a connect that takes `delay` seconds, whatever its timeout says."""
+
+    def __init__(self, inner, delay):
+        self._inner, self.delay = inner, delay
+
+    def connect_tcp(self, *a, **kw):
+        time.sleep(self.delay)
+        return self._inner.connect_tcp(*a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _listening():
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    return srv
+
+
+def _wait_workers_gone(seconds):
+    deadline = time.monotonic() + seconds
+    while _http_workers() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return _http_workers() == []
+
+
+def test_r4_a_connection_that_completes_after_the_deadline_is_closed_and_sends_nothing():
+    srv = _listening()
+    got = {}
+
+    def serve():
+        conn, _ = srv.accept()
+        conn.settimeout(5)
+        try:
+            got["data"] = conn.recv(65536)  # b"" when the client closes without sending
+        except OSError as e:
+            got["error"] = e
+        finally:
+            conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    try:
+        api = Api(f"http://127.0.0.1:{srv.getsockname()[1]}", budget=0.5)
+        api._backend._inner = _SlowConnect(api._backend._inner, 1.0)
+        with pytest.raises(RequestMaybeSent):
+            api.request("GET", "/push/v0/capabilities")
+        assert _wait_workers_gone(1.5)  # the connect returned after the deadline, was closed, and the worker ended
+        deadline = time.monotonic() + 3
+        while "data" not in got and "error" not in got and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert got.get("data") == b""  # the request was never sent on the cancelled client
+        api.close()
+    finally:
+        srv.close()
+
+
+def test_r4_a_cut_during_the_tls_handshake_shuts_the_connection_down():
+    """The server accepts and reads the ClientHello but never answers. The TCP connect takes 1 s, so the handshake's
+    own timeout (the budget at the start of the attempt) would end 1 s after the deadline: only a cut that reaches
+    the socket during start_tls ends it at the deadline."""
+    srv = _listening()
+    closed = threading.Event()
+
+    def stall():
+        conn, _ = srv.accept()
+        conn.settimeout(10)
+        try:
+            conn.recv(65536)  # the ClientHello
+            if conn.recv(65536) == b"":  # then nothing, until the client goes away
+                closed.set()
+        except OSError:
+            closed.set()
+        finally:
+            conn.close()
+
+    threading.Thread(target=stall, daemon=True).start()
+    try:
+        api = Api(f"https://127.0.0.1:{srv.getsockname()[1]}", budget=2.0)
+        api._backend._inner = _SlowConnect(api._backend._inner, 1.0)
+        with pytest.raises(RequestMaybeSent):
+            api.request("GET", "/push/v0/capabilities")
+        raised = time.monotonic()
+        assert _wait_workers_gone(0.4)
+        assert closed.wait(1.0) and time.monotonic() - raised < 0.6
+        api.close()
+    finally:
+        srv.close()
+
+
+def test_r4_a_cancelled_backend_refuses_new_connections():
+    from resink_catalog.cloud.http import _CuttingBackend
+
+    b = _CuttingBackend()
+    b.cut_all()
+    import httpcore2
+
+    with pytest.raises(httpcore2.ConnectError, match="cancelled"):
+        b.connect_tcp("127.0.0.1", 9)

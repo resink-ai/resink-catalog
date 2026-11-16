@@ -123,11 +123,12 @@ class Backoff:
 
 
 class _Cuttable(httpcore2.NetworkStream):
-    """A network stream whose socket the owner can shut down from another thread."""
+    """A connection the owner can shut down from another thread, at any point after the TCP connect: it keeps a
+    duplicate of the raw socket, so a cut reaches the same connection while start_tls is still handshaking (the TLS
+    socket takes over the original socket object, which a cut could no longer use) and after it."""
 
-    def __init__(self, inner: httpcore2.NetworkStream, backend: _CuttingBackend):
-        self._inner, self._backend = inner, backend
-        backend.streams.add(self)
+    def __init__(self, inner: httpcore2.NetworkStream, backend: _CuttingBackend, handle: socket.socket):
+        self._inner, self._backend, self._handle = inner, backend, handle
 
     def read(self, max_bytes, timeout=None):
         return self._inner.read(max_bytes, timeout)
@@ -136,42 +137,95 @@ class _Cuttable(httpcore2.NetworkStream):
         self._inner.write(buffer, timeout)
 
     def close(self):
-        self._backend.streams.discard(self)
-        self._inner.close()
+        self._backend.forget(self)
+        try:
+            self._inner.close()
+        finally:
+            _close_quietly(self._handle)
 
     def start_tls(self, ssl_context, server_hostname=None, timeout=None):
-        self._backend.streams.discard(self)  # the TLS stream owns the socket from now on
-        return _Cuttable(self._inner.start_tls(ssl_context, server_hostname, timeout), self._backend)
+        # this stream stays registered (and cuttable) through the handshake
+        try:
+            tls = self._inner.start_tls(ssl_context, server_hostname, timeout)
+        except BaseException:
+            self.close()
+            raise
+        new = _Cuttable(tls, self._backend, self._handle)
+        self._backend.replace(self, new)  # raises, after closing it, if the client was cancelled meanwhile
+        return new
 
     def get_extra_info(self, info):
         return self._inner.get_extra_info(info)
 
     def cut(self) -> None:
-        sock = self._inner.get_extra_info("socket")
         try:
-            sock.shutdown(socket.SHUT_RDWR)  # wakes a read blocked in another thread; close() alone does not
-        except (OSError, AttributeError):
+            self._handle.shutdown(socket.SHUT_RDWR)  # wakes a read or handshake blocked in another thread
+        except OSError:
             pass
 
 
+def _close_quietly(sock: socket.socket) -> None:
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
 class _CuttingBackend(httpcore2.NetworkBackend):
-    """httpcore's own blocking backend, keeping track of the open streams so that `cut_all` can stop them."""
+    """httpcore's own blocking backend, keeping track of every open connection so that `cut_all` can stop them.
+    Cancellation is sticky: a connection that finishes connecting, or finishes its TLS handshake, after `cut_all`
+    is closed at once and the call raises, so nothing is ever sent on a cancelled client."""
 
     def __init__(self):
         self._inner = httpcore2.SyncBackend()
-        self.streams: set[_Cuttable] = set()
+        self._lock = threading.Lock()
+        self._streams: set[_Cuttable] = set()
+        self.cancelled = False
+
+    def _cancelled_error(self) -> httpcore2.ConnectError:
+        return httpcore2.ConnectError("the request was cancelled at its deadline")
 
     def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
-        return _Cuttable(self._inner.connect_tcp(host, port, timeout, local_address, socket_options), self)
+        if self.cancelled:
+            raise self._cancelled_error()
+        raw = self._inner.connect_tcp(host, port, timeout, local_address, socket_options)
+        try:
+            handle = raw.get_extra_info("socket").dup()
+        except BaseException:
+            raw.close()
+            raise
+        stream = _Cuttable(raw, self, handle)
+        with self._lock:
+            if not self.cancelled:
+                self._streams.add(stream)
+                return stream
+        stream.close()
+        raise self._cancelled_error()
+
+    def replace(self, old: _Cuttable, new: _Cuttable) -> None:
+        with self._lock:
+            self._streams.discard(old)
+            if not self.cancelled:
+                self._streams.add(new)
+                return
+        new.close()
+        raise self._cancelled_error()
+
+    def forget(self, stream: _Cuttable) -> None:
+        with self._lock:
+            self._streams.discard(stream)
 
     def connect_unix_socket(self, path, timeout=None, socket_options=None):  # pragma: no cover - not used
-        return _Cuttable(self._inner.connect_unix_socket(path, timeout, socket_options), self)
+        raise httpcore2.ConnectError("unix sockets are not used by this client")
 
     def sleep(self, seconds):  # pragma: no cover - used by httpcore retries only
         self._inner.sleep(seconds)
 
     def cut_all(self) -> None:
-        for stream in list(self.streams):
+        with self._lock:
+            self.cancelled = True
+            streams = list(self._streams)
+        for stream in streams:
             stream.cut()
 
 
