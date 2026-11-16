@@ -80,6 +80,14 @@ paths:
                 mapping:
                   authorization_code: '#/components/schemas/AuthorizationCodeGrant'
                   refresh_token: '#/components/schemas/RefreshGrant'
+      description: |
+        Errors are OAuth 2.0 error objects (RFC 6749 section 5.2, `application/json`), not problem documents: this is
+        the one endpoint family of the contract that follows OAuth. A refused, burnt, expired or reused code or
+        refresh token is `400 invalid_grant`.
+
+        A refresh token is rotated by every successful use. If a refresh gets `429`, a `5xx` or no answer at all, the
+        client cannot know whether the rotation happened; sending the old token again may count as reuse, which revokes
+        the device. The client therefore stops using that token and asks the user to sign in again.
       responses:
         '200':
           description: Device token. The refresh token is rotated on every use.
@@ -87,9 +95,12 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/DeviceTokenResponse'}
         '400':
-          $ref: '#/components/responses/Problem'
-        '401':
-          $ref: '#/components/responses/Problem'
+          description: An OAuth error (`invalid_request`, `invalid_grant`, `unsupported_grant_type`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OAuthError'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
   /v1/device/revoke:
     post:
       tags: [device-signin]
@@ -100,13 +111,26 @@ paths:
         access tokens. The push receiver polls that list and refuses the device's still unexpired access token with
         `403 forbidden` within the poll interval (5 minutes), at the latest when the token expires (15 minutes).
         Revocation is therefore not instant: after it, at most one publication already sent to the catalog can still land.
+
+        The caller proves it is the device in one of two ways: the body carries its `refresh_token` (works after the
+        access token expired), or the request has the device's unexpired access token as bearer and no body.
       servers:
         - url: https://accounts.resink.ai
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RevokeRequest'}
       responses:
         '204':
           description: Revoked. The receiver refuses this device's tokens within the revoked-list poll interval.
         '401':
-          $ref: '#/components/responses/Problem'
+          description: Neither a refresh token nor a valid device access token was given. A problem document.
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
   /push/v0/capabilities:
     get:
       tags: [push]
@@ -223,13 +247,20 @@ paths:
       tags: [push]
       operationId: abortPush
       summary: Abort a session. Completed staged files are kept until their TTL.
-      description: A session of another device, or an unknown `push_id`, answers `404 not_found`.
+      description: |
+        A session of another device, or an unknown `push_id`, answers `404 not_found`. Aborting a session that is
+        already `aborted` or `expired` is a no-op (`204`). A `committing` session answers `409 push_in_progress`; a
+        `committed` or `failed` one answers `409 session_not_open`, because it has ended and there is nothing to abort.
       responses:
         '204': {description: Aborted. The unused reservation is released; staged bytes stay counted until GC deletes them.}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
-        '409': {$ref: '#/components/responses/Problem'}
+        '409':
+          description: '`push_in_progress` (the session is committing) or `session_not_open` (it is committed or failed).'
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
         '503': {$ref: '#/components/responses/Unavailable'}
   /push/v0/pushes/{push_id}/files/{file_id}:
     parameters:
@@ -356,7 +387,7 @@ components:
       name: push_id
       in: path
       required: true
-      schema: {type: string}
+      schema: {$ref: '#/components/schemas/PushId'}
     FileId:
       name: file_id
       in: path
@@ -398,6 +429,10 @@ components:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
   schemas:
+    PushId:
+      type: string
+      description: One URL path segment of unreserved characters. The receiver issues `push_` followed by URL-safe base64.
+      pattern: '^[A-Za-z0-9._~-]{1,128}$'
     FileId:
       type: string
       pattern: '^[0-9a-f]{64}$'
@@ -410,6 +445,7 @@ components:
         - storage_ceiling
         - staging_full
         - confirmation_required
+        - session_not_open
         - not_found
         - push_in_progress
         - offset_mismatch
@@ -435,7 +471,7 @@ components:
         code: {$ref: '#/components/schemas/ErrorCode'}
         detail: {type: string}
         instance: {type: string, format: uri-reference}
-        push_id: {type: string, description: 'Set on push_in_progress.'}
+        push_id: {$ref: '#/components/schemas/PushId', description: 'Set on push_in_progress.'}
         received_bytes: {type: integer, format: int64, description: 'Set on offset_mismatch.'}
         feature: {type: string, description: 'Set on unsupported_table_feature.'}
         estimated_extra_monthly_cost:
@@ -489,7 +525,7 @@ components:
         refresh_token: {type: string}
     DeviceTokenResponse:
       type: object
-      required: [access_token, token_type, expires_in, refresh_token, device_id, org_id, workspaces]
+      required: [access_token, token_type, expires_in, refresh_token, device_id, org_id, local_workspace_id, workspaces]
       properties:
         access_token: {type: string, description: Device JWT.}
         token_type: {type: string, const: Bearer}
@@ -497,6 +533,9 @@ components:
         refresh_token: {type: string, description: Opaque; rotated on every use.}
         device_id: {type: string}
         org_id: {type: string}
+        local_workspace_id:
+          type: string
+          description: The device's own `local` workspace, the `workspace_id` claim of its tokens. It is not a push target.
         workspaces:
           type: array
           description: Managed workspaces the user may push into.
@@ -507,6 +546,18 @@ components:
               id: {type: string}
               name: {type: string}
               default: {type: boolean}
+    OAuthError:
+      type: object
+      description: RFC 6749 section 5.2.
+      required: [error]
+      properties:
+        error: {type: string, enum: [invalid_request, invalid_grant, unsupported_grant_type]}
+        error_description: {type: string}
+    RevokeRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        refresh_token: {type: string, description: "The device's refresh token. Without a body, the bearer token is used."}
     Capabilities:
       type: object
       required: [protocol_versions, max_file_bytes, chunk_bytes_min, chunk_bytes_max, session_ttl_seconds, staged_file_ttl_seconds]
@@ -533,6 +584,7 @@ components:
         exists: {type: boolean}
         push_managed: {type: boolean, description: False if a table of that name exists but was not created by a push.}
         source_table_uuid: {type: string, format: uuid}
+        cloud_table_id: {type: string, description: The cloud table's id (its Iceberg table uuid). Absent when the table does not exist.}
         last_pushed_source_snapshot_id:
           type: [integer, 'null']
           format: int64
@@ -712,7 +764,7 @@ components:
       type: object
       required: [push_id, state, table, expires_at, admission, files]
       properties:
-        push_id: {type: string}
+        push_id: {$ref: '#/components/schemas/PushId'}
         state: {type: string, enum: [open, committing, committed, failed, aborted, expired]}
         table: {$ref: '#/components/schemas/TableRef'}
         target_workspace_id: {type: string}

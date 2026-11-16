@@ -25,6 +25,7 @@ DOC_ERRORS = {
         "schema_conflict",
         "table_exists",
         "confirmation_required",  # added after the design text: commit of an over_included session without confirmation
+        "session_not_open",  # added after the design text: abort of a committed or failed session (TASK-23, finding 4)
     },
     410: {"session_expired"},
     413: {"file_too_large", "storage_ceiling"},
@@ -269,3 +270,17 @@ def test_no_schema_has_a_stray_null_key():
 
     walk(yaml.safe_load(CONTRACT.read_text()), "")
     assert found == []
+
+
+def test_the_findings_of_the_push_client_review_are_in_the_contract(spec):
+    c = spec["components"]["schemas"]
+    token = spec["paths"]["/v1/device/token"]["post"]["responses"]
+    assert token["400"]["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/OAuthError"}
+    assert "429" in token and "503" in token and "401" not in token
+    assert "local_workspace_id" in c["DeviceTokenResponse"]["required"]
+    assert "requestBody" in spec["paths"]["/v1/device/revoke"]["post"]
+    assert c["RevokeRequest"]["additionalProperties"] is False
+    assert "cloud_table_id" in c["TableState"]["properties"]
+    assert c["PushId"]["pattern"] == "^[A-Za-z0-9._~-]{1,128}$"
+    assert c["PushSession"]["properties"]["push_id"] == {"$ref": "#/components/schemas/PushId"}
+    assert "session_not_open" in c["ErrorCode"]["enum"]
