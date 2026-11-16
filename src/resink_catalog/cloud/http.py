@@ -9,6 +9,7 @@ idempotent). Token exchanges are not: they are retried only when the connection 
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
 from urllib.parse import urlsplit
@@ -35,6 +36,10 @@ class CloudError(Exception):
 
     def lines(self) -> list[str]:
         return problem_lines(self.problem) if self.problem.get("title") else [f"error: {self}"]
+
+
+class RequestMaybeSent(CloudError):
+    """The request may have reached the server, but no complete answer came back: its outcome is unknown."""
 
 
 def problem_lines(problem: dict) -> list[str]:
@@ -127,10 +132,33 @@ class Api:
         refresh: Callable[[str], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        budget: float = RETRY_BUDGET_SECONDS,
     ):
         self.base_url = check_url(base_url)
         self.client = httpx2.Client(base_url=self.base_url, transport=transport, timeout=TIMEOUT)
         self.token, self.refresh, self.sleep, self.clock = token, refresh, sleep, clock
+        self.budget = budget
+
+    def _send(self, limit: float, method: str, path: str, **kw) -> httpx2.Response:
+        """One request, headers and body read in full, within an absolute `limit` in seconds. Per-read timeouts
+        alone do not bound a response that trickles bytes, so the request runs in a worker thread and is abandoned
+        (its connection is never reused for this call) when the limit passes."""
+        out: dict = {}
+
+        def run() -> None:
+            try:
+                out["response"] = self.client.request(method, path, **kw)  # .request reads the whole body
+            except BaseException as e:  # noqa: BLE001 - re-raised in the caller's thread
+                out["error"] = e
+
+        worker = threading.Thread(target=run, daemon=True, name="resink-catalog-http")
+        worker.start()
+        worker.join(max(limit, 0.0))
+        if worker.is_alive():
+            raise RequestMaybeSent(f"no complete answer from {self.base_url} within the time limit")
+        if "error" in out:
+            raise out["error"]
+        return out["response"]
 
     def close(self) -> None:
         self.client.close()
@@ -147,7 +175,7 @@ class Api:
         """`once`: for requests that must not be repeated after they may have reached the server (token exchanges:
         a code is single use, and a resent refresh token counts as reuse and revokes the device). Only a failure to
         connect, where nothing was sent, is retried."""
-        backoff = Backoff(self.sleep, self.clock)
+        backoff = Backoff(self.sleep, self.clock, self.budget)
         refreshed = False
         while True:
             h = dict(headers or {})
@@ -157,10 +185,10 @@ class Api:
                 h["Authorization"] = f"Bearer {sent_token}"
             remaining = backoff.remaining()
             if remaining <= 0:
-                raise CloudError(f"gave up on {self.base_url} after {RETRY_BUDGET_SECONDS:.0f} seconds")
+                raise CloudError(f"gave up on {self.base_url} after {self.budget:.0f} seconds")
             timeout = httpx2.Timeout(min(TIMEOUT.read, remaining), connect=min(TIMEOUT.connect, remaining))
             try:
-                r = self.client.request(method, path, headers=h, timeout=timeout, **kw)
+                r = self._send(remaining, method, path, headers=h, timeout=timeout, **kw)
             except (httpx2.ConnectError, httpx2.ConnectTimeout) as e:
                 if backoff.wait(None):
                     continue
@@ -168,7 +196,7 @@ class Api:
             except httpx2.TransportError as e:
                 if not once and backoff.wait(None):
                     continue
-                raise CloudError(f"lost the connection to {self.base_url}: {e}") from e
+                raise RequestMaybeSent(f"lost the connection to {self.base_url}: {e}") from e
             if not once and r.status_code in RETRY_STATUSES and backoff.wait(retry_after(r)):
                 continue
             if r.status_code == 401 and self.refresh is not None and not refreshed:

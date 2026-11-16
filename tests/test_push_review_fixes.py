@@ -48,7 +48,7 @@ def _lose_token_response(cloud, kind="read"):
 def test_1_a_lost_refresh_answer_is_not_resent_so_the_device_is_not_revoked(cloud, device, store):
     device.transport, seen = _lose_token_response(cloud)
     _expire(device)
-    with pytest.raises(CloudError, match="lost the connection"):
+    with pytest.raises(CloudError, match="sign-in state uncertain"):
         device.access_token()
     assert seen["token"] == 1  # one attempt only: a resent refresh token would count as reuse
     assert not cloud.devices["dev_1"].revoked

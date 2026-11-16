@@ -30,7 +30,7 @@ import httpx2
 
 from ..credentials import NoSecureStore, TokenStore, credentials_dir, open_store
 from ..lock import blocking_lock
-from .http import Api, CloudError, check_url, fail
+from .http import Api, CloudError, RequestMaybeSent, check_url, fail
 
 CLIENT_ID = "resink-catalog"
 # Placeholders from the contract's `servers` (hosts not decided). Tests always pass their own URLs.
@@ -168,6 +168,12 @@ class CallbackListener:
 
 
 NOT_SIGNED_IN = "not signed in: run `resink-catalog login` first"
+IN_FLIGHT = "refresh_in_flight"  # device.json: SHA-256 of a refresh token sent without a clear answer yet
+UNCERTAIN = "sign-in state uncertain; run `resink-catalog login`"
+UNCERTAIN_DETAIL = (
+    "A token refresh got no clear answer, so accounts may already have replaced the refresh token; using it again "
+    "would revoke this device. Run `resink-catalog login` (or `resink-catalog logout --local`)."
+)
 
 
 @dataclass
@@ -219,10 +225,11 @@ class Device:
 
     def _save(self, tokens: dict) -> None:
         """Store a token response (the caller holds the lock): the refresh token first, so a crash can never lose
-        the only valid one."""
+        the only valid one. Clears the in-flight marker of a refresh."""
         self.store.set(REFRESH, tokens["refresh_token"])
         self.store.set(ACCESS, tokens["access_token"])
         self.info["access_expires_at"] = time.time() + int(tokens["expires_in"])
+        self.info.pop(IN_FLIGHT, None)
         _write_private(self.path, self.info)
 
     def _reload(self) -> None:
@@ -242,37 +249,65 @@ class Device:
         return token
 
     def refresh(self, stale: str | None = None) -> None:
-        """Get a new access token in place of `stale` (the one this process found expired or refused). Under the
-        lock: if another process has meanwhile stored a different, unexpired one, use it; else rotate the refresh
-        token once. The exchange is never resent once it may have reached accounts. If accounts refuses the refresh
-        token (reused, revoked, expired), the local tokens are useless: delete them, but only if they are still
-        the ones this process sent, and tell the user to sign in again."""
+        """Get a new access token in place of `stale` (the one this process found expired or refused), under the
+        credentials lock."""
         with self.lock():
             self._reload()
-            current = self.store.get(ACCESS)
-            if current and current != stale and not self._expired():
-                return
-            sent = self.store.get(REFRESH)
-            if not sent:
-                raise CloudError(NOT_SIGNED_IN)
+            self._refresh_locked(stale)
+
+    def _refresh_locked(self, stale: str | None) -> None:
+        """If another process has meanwhile stored a different, unexpired access token, use it; else rotate the
+        refresh token once.
+
+        Before the exchange is sent, device.json records that this refresh token is in flight. If no clear answer
+        comes back (lost connection, time limit, a 5xx or 429), accounts may have rotated it: sending it again would
+        count as reuse and revoke the device. So the marker stays, and every later refresh with that token is refused
+        with "sign-in state uncertain" until the user signs in again. If accounts refuses the token (invalid_grant),
+        the local tokens are useless and are deleted (the lock is held, so they are still the ones that were sent)."""
+        current = self.store.get(ACCESS)
+        if current and current != stale and not self._expired():
+            return
+        sent = self.store.get(REFRESH)
+        if not sent:
+            raise CloudError(NOT_SIGNED_IN)
+        fingerprint = hashlib.sha256(sent.encode()).hexdigest()
+        if self.info.get(IN_FLIGHT) == fingerprint:
+            raise CloudError(UNCERTAIN, {"title": "Sign-in state uncertain", "detail": UNCERTAIN_DETAIL})
+        self.info[IN_FLIGHT] = fingerprint
+        _write_private(self.path, self.info)  # durable before anything is sent
+        try:
             with Api(self.accounts_url, transport=self.transport, sleep=self.sleep, clock=self.clock) as api:
                 body = {"grant_type": "refresh_token", "client_id": CLIENT_ID, "refresh_token": sent}
                 r = api.request("POST", "/v1/device/token", json=body, once=True)
-            if r.status_code == 200:
-                self._save(r.json())
-                return
-            err = fail(r)
-            if err.code != "invalid_grant":
-                raise err
-            if self.store.get(REFRESH) == sent:
-                self._forget()
-            reason = err.problem.get("detail") or err.problem.get("title")
-            problem = {
-                "title": "Your sign-in is no longer valid",
-                "code": err.code,
-                "detail": f"accounts refused the refresh token ({reason}). Run `resink-catalog login` again.",
-            }
-            raise CloudError(problem["detail"], problem, r.status_code)
+        except RequestMaybeSent as e:
+            raise CloudError(
+                UNCERTAIN, {"title": "Sign-in state uncertain", "detail": f"{e}. {UNCERTAIN_DETAIL}"}
+            ) from e
+        except CloudError:  # could not connect at all: nothing was sent, the token is still good
+            self._clear_in_flight()
+            raise
+        if r.status_code == 200:
+            self._save(r.json())
+            return
+        err = fail(r)
+        if r.status_code >= 500 or r.status_code == 429:  # an answer, but not whether the rotation happened
+            detail = f"accounts answered {r.status_code} {err.problem.get('title')}. {UNCERTAIN_DETAIL}"
+            raise CloudError(UNCERTAIN, {"title": "Sign-in state uncertain", "detail": detail}, r.status_code)
+        if err.code != "invalid_grant":  # refused before rotating (a malformed request): the token is untouched
+            self._clear_in_flight()
+            raise err
+        self._forget()
+        reason = err.problem.get("detail") or err.problem.get("title")
+        problem = {
+            "title": "Your sign-in is no longer valid",
+            "code": err.code,
+            "detail": f"accounts refused the refresh token ({reason}). Run `resink-catalog login` again.",
+        }
+        raise CloudError(problem["detail"], problem, r.status_code)
+
+    def _clear_in_flight(self) -> None:
+        self.info.pop(IN_FLIGHT, None)
+        _write_private(self.path, self.info)
 
     def _forget(self) -> None:
         self.store.delete(ACCESS)
@@ -360,18 +395,27 @@ def login(
 
 
 def logout(device: Device, *, local_only: bool = False) -> None:
-    """Revoke the device at accounts (with its own device token), then delete the local tokens. If accounts cannot be
-    reached the tokens are kept, so the user can retry; `local_only` deletes them without revoking."""
-    if not local_only:
+    """Revoke the device at accounts (with its own device token), then delete the local tokens. The whole of it runs
+    under the credentials lock, on credentials re-read inside it, so it never deletes tokens a concurrent sign-in
+    saved after it started. If accounts cannot be reached the tokens are kept, so the user can retry; `local_only`
+    deletes them without revoking."""
+    with device.lock():
         try:
-            token = device.access_token()
-        except CloudError as e:
-            if e.code == "invalid_grant":  # the refresh token is already refused: the device is revoked or expired
-                device.forget()
-                return
-            raise
-        with Api(device.accounts_url, transport=device.transport, sleep=device.sleep, clock=device.clock) as api:
-            r = api.request("POST", "/v1/device/revoke", headers={"Authorization": f"Bearer {token}"})
-        if r.status_code != 204:
-            raise fail(r, "logout failed (your local tokens are kept; retry, or use --local): ")
-    device.forget()
+            device._reload()
+        except CloudError:
+            return  # already signed out
+        if not local_only:
+            token = device.store.get(ACCESS)
+            if not token or device._expired():
+                try:
+                    device._refresh_locked(token)
+                except CloudError as e:
+                    if e.code == "invalid_grant":  # refused: the device is revoked or expired; tokens are deleted
+                        return
+                    raise
+                token = device.store.get(ACCESS)
+            with Api(device.accounts_url, transport=device.transport, sleep=device.sleep, clock=device.clock) as api:
+                r = api.request("POST", "/v1/device/revoke", headers={"Authorization": f"Bearer {token}"})
+            if r.status_code != 204:
+                raise fail(r, "logout failed (your local tokens are kept; retry, or use --local): ")
+        device._forget()

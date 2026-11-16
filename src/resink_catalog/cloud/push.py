@@ -54,7 +54,7 @@ HASH_BLOCK = 1024 * 1024
 POLL_SECONDS = 1.0
 COMMIT_WAIT_SECONDS = 15 * 60  # a commit runs at most 10 minutes (section 7)
 SESSION_ATTEMPTS = 20  # ended sessions walked per run; the chain position is kept in catalog.db, so reruns go on
-MAX_STALLS = 3  # upload answers in a row that do not move a file forward
+MAX_STALLS = 3  # upload answers per file that bring it no further than it has already been
 # The contract gives push_id no format: accept only unreserved URL characters, so it is always one path segment.
 PUSH_ID = re.compile(r"^[A-Za-z0-9._~-]{1,128}$")
 FILE_ID = re.compile(r"^[0-9a-f]{64}$")  # the contract's FileId
@@ -521,10 +521,12 @@ class Pusher:
 
     def _upload(self, push_id: str, f: LocalFile, offset: int, chunk: int, report: PushReport) -> None:
         """Chunks from the receiver's offset. Memory stays at one chunk whatever the file size. Every offset the
-        receiver reports is checked (0 <= offset <= size, `complete` only with every byte), and the upload stops if
-        MAX_STALLS answers in a row do not move the file forward."""
+        receiver reports is checked (0 <= offset <= size, `complete` only with every byte). Progress is measured
+        against the highest offset reached so far, so a receiver that moves the offset back and forth cannot keep
+        the client busy: after MAX_STALLS answers that bring no new progress the upload stops. One explicit
+        checksum restart (back to 0) is allowed on top."""
         path = file_path(push_id, f.file_id)
-        restarted, stalls = False, 0
+        restarted, stalls, high = False, 0, offset
         with f.io.new_input(f.path).open() as stream:
             while offset < f.size:
                 stream.seek(offset)
@@ -534,7 +536,6 @@ class Pusher:
                     "Content-Type": "application/octet-stream",
                 }
                 r = self.api.request("PATCH", path, content=data, headers=headers)
-                before = offset
                 if r.status_code == 200:
                     status = r.json()
                     report.bytes_uploaded += len(data)
@@ -546,11 +547,14 @@ class Pusher:
                     if err.code == "offset_mismatch" and "received_bytes" in err.problem:
                         offset = _received(err.problem["received_bytes"], f)
                     elif err.code == "checksum_mismatch" and not restarted:
-                        restarted, offset = True, 0  # the receiver reset the file; send it once more
+                        restarted, offset, high = True, 0, 0  # the receiver reset the file; send it once more
                         continue
                     else:
                         raise err
-                stalls = stalls + 1 if offset <= before else 0
+                if offset > high:
+                    high = offset
+                else:
+                    stalls += 1
                 if stalls >= MAX_STALLS:
                     raise CloudError(
                         f"the upload of {f.file_id} makes no progress (the receiver stays at {offset} of {f.size} "
