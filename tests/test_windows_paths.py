@@ -110,3 +110,38 @@ def test_a_crlf_inside_a_quoted_value_is_kept_exactly(tmp_path):
     f.write_bytes(b'id,note\r\n1,"line one\r\r\nline two"\r\n2,plain\r\n')
     t = read_csv(f)
     assert t.column("note").to_pylist() == ["line one\r\r\nline two", "plain"]
+
+
+def test_doubled_separators_with_a_quoted_value_are_refused_not_altered(tmp_path):
+    """A header-only-style failure needs the repair, but a quote means a `\\r\\r\\n` could be data: refuse the file."""
+    f = tmp_path / "bad.csv"
+    f.write_bytes(b'id,"na\r\r\nme",amount\r\r\n')  # header only, doubled separator, and a quote
+    with pytest.raises(ReadError, match=r"doubled carriage returns"):
+        read_csv(f)
+
+
+def test_windows_renames_are_write_through_and_posix_renames_flush_both_directories(tmp_path, monkeypatch):
+    """The Windows branch runs everywhere with the API call mocked; CI runs the real `MoveFileExW`."""
+    from resink_catalog import restore_journal as rj
+
+    calls, flushed = [], []
+    monkeypatch.setattr(rj, "_move_file_ex", lambda s, d, flags: calls.append((s, d, flags)))
+    monkeypatch.setattr(rj, "fsync_dir", flushed.append)
+
+    monkeypatch.setattr(rj, "_POSIX", False)
+    a, b = tmp_path / "a", tmp_path / "sub" / "b"
+    rj.durable_rename(a, b)
+    assert calls == [(str(a), str(b), rj.MOVEFILE_WRITE_THROUGH)]  # a rename never replaces
+    assert rj.MOVEFILE_WRITE_THROUGH == 0x8 and rj.MOVEFILE_REPLACE_EXISTING == 0x1
+
+    calls.clear()
+    rj.write_journal(tmp_path, {"state": "swapping"})
+    ((src, dst, flags),) = calls
+    assert dst == str(tmp_path / rj.JOURNAL) and flags == 0x8 | 0x1  # the journal replaces the old one, durably
+    assert flushed == []  # no directory is opened on Windows
+
+    monkeypatch.setattr(rj, "_POSIX", True)
+    (tmp_path / "a").write_text("x")
+    (tmp_path / "sub").mkdir()
+    rj.durable_rename(a, b)
+    assert flushed == [tmp_path / "sub", tmp_path]  # destination parent, then the (different) source parent
