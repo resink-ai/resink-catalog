@@ -116,6 +116,19 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--home", type=Path, default=None, help="data directory")
     c.add_argument("--min-age-hours", type=float, default=24, help="leave younger files alone (default 24)")
     c.add_argument("--dry-run", action="store_true", help="only list the files")
+    li = sub.add_parser("login", help="sign this computer in to Resink cloud (opens the browser)")
+    li.add_argument("--accounts-url", help="accounts service (default $RESINK_ACCOUNTS_URL, else production)")
+    li.add_argument("--push-url", help="push receiver (default $RESINK_PUSH_URL, else production)")
+    li.add_argument("--workspace", help="target cloud workspace id (default: the one chosen in the browser)")
+    li.add_argument("--no-browser", action="store_true", help="only print the sign-in URL")
+    lo = sub.add_parser("logout", help="revoke this computer's sign-in and delete the local tokens")
+    lo.add_argument("--local", action="store_true", help="only delete the local tokens (when accounts is unreachable)")
+    pu = sub.add_parser("push", help="send a table's new snapshots to Resink cloud")
+    pu.add_argument("table", help="local table, 'name' or 'namespace.name'")
+    pu.add_argument("--home", type=Path, default=None, help="data directory")
+    pu.add_argument("--workspace", help="target cloud workspace id (default: chosen at sign-in)")
+    pu.add_argument("--to", metavar="NAMESPACE.NAME", help="cloud table name (default: the local one)")
+    pu.add_argument("--yes", action="store_true", help="accept extra storage cost without asking")
     for name, help_ in (
         ("import", "import a file, or apply the proposal for a folder added with add-folder"),
         ("add-folder", "find data files in a folder and propose tables; imports nothing"),
@@ -210,8 +223,75 @@ def run_command(args) -> int:
     return 0
 
 
+CLOUD_TRANSPORT = None  # tests put a fake cloud (an httpx transport) here; None is the network
+
+
+def _confirm_cost(admission: dict) -> bool:
+    cost = admission.get("estimated_extra_monthly_cost") or {}
+    print(
+        f"This push exceeds your organization's included storage by {admission.get('over_included_bytes', '?')} bytes; "
+        f"estimated extra cost {cost.get('amount', '?')} {cost.get('currency', '')} per month.",
+        file=sys.stderr,
+    )
+    if not sys.stdin.isatty():
+        return False
+    return input("Continue? [y/N] ").strip().lower() in ("y", "yes")
+
+
+def cloud_command(args) -> int:
+    from .cloud.http import CloudError
+    from .cloud.signin import Device, login, logout
+
+    def err(line: str) -> None:
+        print(line, file=sys.stderr, flush=True)
+
+    try:
+        if args.command == "login":
+            d = login(
+                args.accounts_url,
+                args.push_url,
+                workspace=args.workspace,
+                transport=CLOUD_TRANSPORT,
+                open_browser=None if args.no_browser else webbrowser.open,
+                out=err,
+            )
+            names = {w["id"]: w["name"] for w in d.info["workspaces"]}
+            ws = d.info["target_workspace_id"]
+            print(f"signed in as device {d.info['device_id']}; pushes go to workspace {names.get(ws, ws) or 'none'}")
+            return 0
+        device = Device.load(transport=CLOUD_TRANSPORT)
+        if args.command == "logout":
+            logout(device, local_only=args.local)
+            print("signed out: " + ("local tokens deleted" if args.local else "device revoked, local tokens deleted"))
+            return 0
+        from .cloud.push import Pusher
+
+        with Catalog(args.home or default_home()) as cat:
+            pusher = Pusher(
+                cat, device, transport=CLOUD_TRANSPORT, out=err, confirm=(lambda a: True) if args.yes else _confirm_cost
+            )
+            try:
+                rep = pusher.push(args.table, workspace=args.workspace, target=args.to)
+            finally:
+                pusher.close()
+        if rep.snapshots == 0:
+            print(f"{rep.table} is up to date in {rep.workspace_id}/{rep.target}; nothing sent")
+        else:
+            print(
+                f"pushed {rep.table} to {rep.workspace_id}/{rep.target}: {rep.snapshots} snapshot(s), "
+                f"{rep.files_uploaded} file(s), {rep.bytes_uploaded} bytes uploaded"
+            )
+        return 0
+    except CloudError as e:
+        for line in e.lines():
+            err(line)
+        return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command in ("login", "logout", "push"):
+        return cloud_command(args)
     if args.command == "agent-kit":
         from . import agent_kit
 

@@ -73,9 +73,19 @@ Limit: Iceberg metadata records absolute paths, so a backup restores only to the
 
 An import that is killed part-way leaves data files nothing references. `resink-catalog cleanup [--min-age-hours N] [--dry-run]` removes them, and `serve` does the same when it starts and nobody else has the catalog open. Cleanup takes the same exclusive lock as `restore`: while any process (a server, an MCP session, an import) has the catalog open it refuses, so it can never delete a file an import is about to commit, whatever the file's age, and `--min-age-hours 0` is safe. The age limit (default 24 hours) only protects data files that an external REST client wrote before the server restarted and commits afterwards.
 
-## Push credentials
+## Push to Resink cloud
 
-The push client (a later milestone) stores its device tokens in the macOS Keychain or the Windows Credential Manager, chosen explicitly (not whatever backend the `keyring` package happens to select). If none is usable, for example on Linux, it refuses. Setting `RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS=1` opts in to a file `~/.config/resink-catalog/credentials.json` with mode 0600 (`RESINK_CATALOG_CREDENTIALS_DIR` overrides the directory), with a warning in the log; this is not offered on Windows. Tokens are never written to `catalog.db`, and `backup` does not copy them. The local access token (`~/.resink-catalog/token`) is a different thing: it only protects your own local server.
+```sh
+resink-catalog login                 # opens the browser; pick the cloud workspace there
+resink-catalog push shop.orders      # sends only the snapshots the cloud does not have yet
+resink-catalog logout                # revokes this computer's sign-in and deletes the local tokens
+```
+
+`login` uses the authorization code flow with PKCE and a one-time listener on `127.0.0.1` (a random port); it prints the sign-in URL as well, and gives up after 5 minutes. `push` asks the cloud what it already holds for the table, then sends, per newer local snapshot, the data files it added and removed and its schema. An interrupted push (closed laptop, lost network, killed process) resumes when you run it again and sends only the bytes the cloud is missing. The cloud table's name defaults to the local one (`--to NAMESPACE.NAME` changes it) and the workspace to the one chosen at sign-in (`--workspace ID`). Tables with delete files (for example after a DuckDB `DELETE`), partitioning, non-Parquet files or Iceberg format version 3 are refused before anything is sent. The cloud addresses come from `--accounts-url`/`--push-url` at login, or `RESINK_ACCOUNTS_URL`/`RESINK_PUSH_URL`.
+
+### Push credentials
+
+The push client stores its device tokens in the macOS Keychain or the Windows Credential Manager, chosen explicitly (not whatever backend the `keyring` package happens to select). If none is usable, for example on Linux, it refuses. Setting `RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS=1` opts in to a file `~/.config/resink-catalog/credentials.json` with mode 0600 (`RESINK_CATALOG_CREDENTIALS_DIR` overrides the directory), with a warning in the log; this is not offered on Windows. What is not secret (device id, workspaces, cloud addresses) is in `device.json` in the same directory. Tokens are never written to `catalog.db`, and `backup` does not copy them; `catalog.db` keeps only `push_state`, a cache of what was last pushed. The local access token (`~/.resink-catalog/token`) is a different thing: it only protects your own local server.
 
 ## Import your files
 

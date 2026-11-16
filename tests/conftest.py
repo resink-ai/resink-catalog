@@ -6,9 +6,12 @@ from pathlib import Path
 
 import pytest
 import uvicorn
+from fake_cloud import ACCOUNTS, PUSH, FakeCloud, browser
 
 from resink_catalog.app import create_app
 from resink_catalog.catalog import Catalog
+from resink_catalog.cloud.signin import login
+from resink_catalog.credentials import FileStore
 
 TOKEN = "test-token-value"
 
@@ -56,3 +59,41 @@ def live_server(home):
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+# ---------------------------------------------------------------- push client (L5a): a fake cloud and a signed-in device
+
+
+@pytest.fixture
+def cloud() -> FakeCloud:
+    return FakeCloud()
+
+
+@pytest.fixture
+def cred_dir(tmp_path, monkeypatch):
+    d = tmp_path / "cred"
+    monkeypatch.setenv("RESINK_CATALOG_CREDENTIALS_DIR", str(d))
+    return d
+
+
+@pytest.fixture
+def store(cred_dir) -> FileStore:
+    return FileStore(cred_dir)
+
+
+@pytest.fixture
+def sleeps() -> list[float]:
+    return []
+
+
+@pytest.fixture
+def device(cloud, store, sleeps):
+    return login(
+        ACCOUNTS,
+        PUSH,
+        store=store,
+        transport=cloud.transport(),
+        open_browser=browser(cloud),
+        out=lambda s: None,
+        sleep=sleeps.append,
+    )

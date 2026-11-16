@@ -26,7 +26,7 @@ def test_init_db_idempotent(tmp_path):
     conn = sqlite3.connect(tmp_path / "catalog.db")
     rows = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchall()
     conn.close()
-    assert rows == [("4",)]
+    assert rows == [("5",)]
 
 
 def test_a_bind_mounted_directory_we_cannot_chmod_is_accepted_if_it_is_private(tmp_path, monkeypatch):
