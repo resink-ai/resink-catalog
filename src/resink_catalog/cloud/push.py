@@ -80,7 +80,27 @@ class PushReport:
     bytes_uploaded: int = 0
     last_pushed_snapshot_id: int | None = None
     cloud_table_id: str | None = None
+    cloud_name: str = ""  # the table's name in the cloud workspace, as the receiver names it
     sessions: list[str] = field(default_factory=list)
+
+
+def cloud_table_name(namespace: str, name: str) -> str:
+    """The receiver's naming (push_core `cloud_table_name`): the workspace is the cloud schema, so the local namespace
+    becomes a prefix, `<namespace>__<name>`, except for `default`, which is dropped."""
+    return name if namespace == "default" else f"{namespace}__{name}"
+
+
+def table_exists_problem(target: str) -> CloudError:
+    return CloudError(
+        "table exists",
+        {
+            "title": "Table exists",
+            "code": "table_exists",
+            "detail": f"the cloud workspace already has a table {target} that was not created by a push; "
+            "a push never writes into it. Nothing was sent.",
+            "resolution": [{"action": "use_new_table_name", "detail": "push to a new name with --to NAMESPACE.NAME"}],
+        },
+    )
 
 
 # ----------------------------------------------------------------------------------------------- local planning
@@ -391,18 +411,21 @@ class Pusher:
             raise CloudError(str(e)) from None
         local = f"{ns}.{tbl}"
         ws = workspace or self.device.default_workspace()
-        report = PushReport(local, f"{tns}.{tname}", ws)
+        report = PushReport(local, f"{tns}.{tname}", ws, cloud_name=cloud_table_name(tns, tname))
         try:
             table = self.cat.iceberg.load_table((ns, tbl))
         except (NoSuchTableError, NoSuchNamespaceError):
             raise CloudError(f"no such table: {local}") from None
         caps = self.capabilities()
         state = self._get("/push/v0/table-state", params={"workspace_id": ws, "namespace": [tns], "name": tname})
+        if state.get("exists") and not state.get("push_managed"):  # before any scan or hash of the local table
+            raise table_exists_problem(report.target)
         cloud_last = state.get("last_pushed_source_snapshot_id") if state.get("exists") else None
+        report.cloud_table_id = state.get("cloud_table_id")
         todo = new_snapshots(table, cloud_last)
         if not todo:
             if state.get("exists"):
-                record_push_state(self.cat, local, ws, report.target, cloud_last, None)
+                record_push_state(self.cat, local, ws, report.target, cloud_last, report.cloud_table_id)
             report.last_pushed_snapshot_id = cloud_last
             return report
         features = unsupported_features(table, todo)
@@ -468,6 +491,9 @@ class Pusher:
                     if d.status_code == 204:
                         self.out(f"aborted an unfinished earlier push of this table ({err.problem['push_id']})")
                         aborted = True
+                        continue
+                    if d.status_code == 409 and fail(d).code == "session_not_open":
+                        aborted = True  # it ended (committed or failed) meanwhile: nothing to abort; try again
                         continue
             raise err
         raise CloudError(

@@ -56,18 +56,11 @@ def test_1_a_lost_refresh_answer_is_not_resent_so_the_device_is_not_revoked(clou
 
 
 def test_1_a_503_from_the_token_endpoint_is_not_retried(cloud, device):
-    """(Not through the contract-checking fake: the YAML declares no 503 for /v1/device/token.)"""
-    calls = []
-
-    def busy(req):
-        calls.append(req.url.path)
-        return problem(503, "unavailable", "Unavailable", "busy")
-
-    device.transport = httpx2.MockTransport(busy)
+    cloud.faults.append(("POST", "/v1/device/token", problem(503, "unavailable", "Unavailable", "busy")))
     _expire(device)
     with pytest.raises(CloudError):
         device.access_token()
-    assert calls == ["/v1/device/token"]
+    assert len(cloud.calls("POST", "/v1/device/token")) == 2  # sign-in, and the one refresh attempt
 
 
 def test_1_a_connect_error_before_sending_is_retried(cloud, device, sleeps):
@@ -180,6 +173,7 @@ def test_4_a_session_with_a_traversal_push_id_is_never_used_in_a_path(cloud, dev
         },
         "files": [],
     }
+    cloud.check_fault_responses = False  # a hostile receiver: this push_id breaks the contract's PushId pattern
     cloud.faults.append(("POST", r"/pushes$", httpx2.Response(201, json=session)))
     with pytest.raises(CloudError, match="invalid push_id"):
         make_pusher(catalog, device, cloud).push(T)

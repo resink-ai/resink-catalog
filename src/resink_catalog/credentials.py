@@ -117,10 +117,12 @@ _warned = False
 
 
 def _warn_once(message: str, *args) -> None:
+    """A notice for the user, once per process, on stderr (stdout carries command output and, for `mcp`, the
+    protocol)."""
     global _warned
     if not _warned:
         _warned = True
-        log.warning(message, *args)
+        print(f"notice: {message % args}", file=sys.stderr, flush=True)
 
 
 def open_store(platform: str | None = None, env: dict | None = None) -> TokenStore:

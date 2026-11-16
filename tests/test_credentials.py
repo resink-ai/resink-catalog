@@ -79,17 +79,17 @@ def test_an_unusable_native_store_fails_closed_even_if_keyring_has_another_backe
         open_store("darwin", env={})
 
 
-def test_linux_uses_a_private_file_by_default_and_warns_once(monkeypatch, tmp_path, caplog):
+def test_linux_uses_a_private_file_by_default_and_warns_once(monkeypatch, tmp_path, capsys):
     """Decision 11: no native store on Linux, so a 0600 file in a 0700 directory, without any opt-in."""
     import resink_catalog.credentials as credentials
 
     monkeypatch.setattr(credentials, "_warned", False)
     monkeypatch.setenv("RESINK_CATALOG_CREDENTIALS_DIR", str(tmp_path / "cfg"))
-    with caplog.at_level("WARNING"):
-        store = open_store("linux", env={})
-        open_store("linux", env={})
+    store = open_store("linux", env={})
+    open_store("linux", env={})
     assert isinstance(store, FileStore) and store.path == tmp_path / "cfg" / "credentials.json"
-    assert caplog.text.count("mode 0600") == 1
+    out, err = capsys.readouterr()
+    assert out == "" and err.count("no OS credential store on linux") == 1  # stderr, once; never stdout
     store.set("device", "t")
     if os.name == "posix":
         assert stat.S_IMODE(store.path.stat().st_mode) == 0o600

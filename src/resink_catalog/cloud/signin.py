@@ -383,6 +383,7 @@ def login(
     info = {
         "device_id": tokens["device_id"],
         "org_id": tokens["org_id"],
+        "local_workspace_id": tokens["local_workspace_id"],  # the device's own workspace; not a push target
         "workspaces": workspaces,
         "target_workspace_id": chosen,
         "accounts_url": accounts_url,

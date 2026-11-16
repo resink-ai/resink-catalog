@@ -274,11 +274,12 @@ def cloud_command(args) -> int:
                 rep = pusher.push(args.table, workspace=args.workspace, target=args.to)
             finally:
                 pusher.close()
+        where = f"workspace {rep.workspace_id}, cloud table {rep.cloud_name}"
         if rep.snapshots == 0:
-            print(f"{rep.table} is up to date in {rep.workspace_id}/{rep.target}; nothing sent")
+            print(f"{rep.table} is up to date in {where}; nothing sent")
         else:
             print(
-                f"pushed {rep.table} to {rep.workspace_id}/{rep.target}: {rep.snapshots} snapshot(s), "
+                f"pushed {rep.table} to {where}: {rep.snapshots} snapshot(s), "
                 f"{rep.files_uploaded} file(s), {rep.bytes_uploaded} bytes uploaded"
             )
         return 0

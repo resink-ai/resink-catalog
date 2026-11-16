@@ -437,7 +437,6 @@ def test_cli_login_push_logout(cloud, catalog, capsys, monkeypatch, store, home)
     assert cloud.devices["dev_1"].revoked and store.get("refresh_token") is None
     assert main(["push", T, "--home", str(home)]) == 1
     assert "not signed in" in capsys.readouterr().err
-    assert cloud.unchecked == []
 
 
 def test_cloud_urls_come_from_flags_env_or_sign_in(monkeypatch):

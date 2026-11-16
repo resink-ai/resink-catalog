@@ -45,7 +45,7 @@ def problem(status: int, code: str, title: str, detail: str = "", **extra) -> ht
 
 
 def oauth_error(detail: str) -> httpx2.Response:
-    """What accounts' /v1/device/token answers (A8: RFC 6749 error JSON), not the contract's problem document."""
+    """What accounts' /v1/device/token answers: an RFC 6749 error object (the contract's OAuthError)."""
     return httpx2.Response(400, json={"error": "invalid_grant", "error_description": detail})
 
 
@@ -114,8 +114,8 @@ class FakeCloud:
         self.over_included = False
         self.end_new_sessions = 0
         self.patch_delay = 0.0  # seconds per chunk, served mode only
+        self.check_fault_responses = True  # off only where a test injects a response the contract forbids
         self.check_requests = True  # off only where a test sends a request the contract forbids on purpose
-        self.unchecked: list[str] = []  # exchanges deliberately not checked against the YAML (known deviations)
 
     # ------------------------------------------------------------------------------------------------ plumbing
 
@@ -129,17 +129,14 @@ class FakeCloud:
                 if method == req.method and re.search(pattern, path):
                     del self.faults[i]
                     check_request(req)
-                    check_response(req, resp)
+                    if self.check_fault_responses:
+                        check_response(req, resp)
                     self.log.append((req.method, path, resp.status_code))
                     return resp
             if self.check_requests:
                 check_request(req)
             resp = self._route(req)
-            known_deviation = path == "/v1/device/token" and resp.status_code == 400 and "error" in resp.json()
-            if known_deviation:
-                self.unchecked.append(f"{req.method} {path} {resp.status_code}")
-            else:
-                check_response(req, resp)
+            check_response(req, resp)
             self.log.append((req.method, path, resp.status_code))
             return resp
 
@@ -170,10 +167,12 @@ class FakeCloud:
             return problem(404, "not_found", "Not found")
         if len(parts) == 5 and m == "GET":
             return _json(200, self._view(s))
-        if len(parts) == 5 and m == "DELETE":
-            if s.state != "open":
-                return problem(409, "push_in_progress", "Session is not open")
-            s.state = "aborted"
+        if len(parts) == 5 and m == "DELETE":  # the contract's abort semantics
+            if s.state == "committing":
+                return problem(409, "push_in_progress", "Push in progress", "the session is committing")
+            if s.state in ("committed", "failed"):
+                return problem(409, "session_not_open", "Session not open", f"the session is {s.state}")
+            s.state = "aborted"  # open, or already aborted or expired: a no-op
             return httpx2.Response(204)
         if len(parts) == 7 and m == "PATCH":
             return self.patch(s, parts[6], req)
@@ -288,6 +287,7 @@ class FakeCloud:
                 "exists": True,
                 "push_managed": t.push_managed,
                 "source_table_uuid": t.source_table_uuid,
+                "cloud_table_id": t.id,
                 "last_pushed_source_snapshot_id": last["source"] if last else None,
                 "cloud_snapshot_id": last["cloud"] if last else None,
                 "last_pushed_at": None,

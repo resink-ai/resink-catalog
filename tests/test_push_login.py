@@ -35,7 +35,6 @@ def test_p2_login_happy_path_leaves_a_device_token(cloud, store, cred_dir):
     assert info["target_workspace_id"] == "ws_main"  # the workspace marked default (chosen in the browser)
     assert (info["accounts_url"], info["push_url"]) == (ACCOUNTS, PUSH)
     assert "access_token" not in json.dumps(info) and store.get("access_token") not in json.dumps(info)
-    assert cloud.unchecked == []  # every exchange was checked against the YAML
 
 
 def test_p2_the_challenge_is_s256_of_the_verifier():
