@@ -179,7 +179,7 @@ def test_p7_a_lost_connection_mid_upload_resumes_from_the_servers_offset(cloud, 
     assert cloud.patch_bytes == sum(len(b) for b in cloud.blobs["ws_main"].values())  # no byte stored twice
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="the plaintext token file is refused on Windows")
+@pytest.mark.skipif(sys.platform in ("win32", "darwin"), reason="the subprocess reads the 0600 file store, Linux only")
 def test_p7_a_real_process_killed_mid_upload_then_rerun(tmp_path, catalog, home):
     """`resink-catalog push` in a subprocess against the fake served on 127.0.0.1, killed (SIGKILL) mid-upload."""
     cloud = FakeCloud(chunk_min=256, chunk_max=256)
@@ -191,7 +191,6 @@ def test_p7_a_real_process_killed_mid_upload_then_rerun(tmp_path, catalog, home)
         env = {
             **os.environ,
             "RESINK_CATALOG_CREDENTIALS_DIR": str(tmp_path / "cred"),
-            "RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS": "1",
             "RESINK_ACCOUNTS_URL": url,
             "RESINK_PUSH_URL": url,
         }
@@ -446,10 +445,10 @@ def test_cloud_urls_come_from_flags_env_or_sign_in(monkeypatch):
 
     monkeypatch.delenv("RESINK_ACCOUNTS_URL", raising=False)
     monkeypatch.delenv("RESINK_PUSH_URL", raising=False)
-    assert cloud_urls(saved={"accounts_url": "http://a", "push_url": "http://p"}) == ("http://a", "http://p")
-    monkeypatch.setenv("RESINK_PUSH_URL", "http://env-p/")
-    assert cloud_urls(saved={"push_url": "http://p"})[1] == "http://env-p"
-    assert cloud_urls(push_url="http://flag")[1] == "http://flag"
+    assert cloud_urls(saved={"accounts_url": "https://a", "push_url": "https://p"}) == ("https://a", "https://p")
+    monkeypatch.setenv("RESINK_PUSH_URL", "https://env-p/")
+    assert cloud_urls(saved={"push_url": "https://p"})[1] == "https://env-p"
+    assert cloud_urls(push_url="https://flag")[1] == "https://flag"
 
 
 def test_no_production_host_in_the_tests():

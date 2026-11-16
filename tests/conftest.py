@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import uvicorn
 from fake_cloud import ACCOUNTS, PUSH, FakeCloud, browser
+from push_helpers import Sleeps
 
 from resink_catalog.app import create_app
 from resink_catalog.catalog import Catalog
@@ -82,8 +83,8 @@ def store(cred_dir) -> FileStore:
 
 
 @pytest.fixture
-def sleeps() -> list[float]:
-    return []
+def sleeps() -> Sleeps:
+    return Sleeps()
 
 
 @pytest.fixture
@@ -96,4 +97,5 @@ def device(cloud, store, sleeps):
         open_browser=browser(cloud),
         out=lambda s: None,
         sleep=sleeps.append,
+        clock=sleeps.clock,
     )

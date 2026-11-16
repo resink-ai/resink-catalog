@@ -102,14 +102,15 @@ class CatalogLock:
             pass
 
 
-class recovery_guard:  # noqa: N801 - used as a context manager
-    """A blocking exclusive lock that serialises crash recovery between processes starting at the same moment."""
+class blocking_lock:  # noqa: N801 - used as a context manager
+    """A blocking exclusive lock on a file, between processes."""
 
-    def __init__(self, home: Path):
-        self._path = Path(home) / ".restore-recovery.lock"
+    def __init__(self, path: Path):
+        self._path = Path(path)
         self._fd: int | None = None
 
     def __enter__(self):
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         self._fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
         if os.name == "posix":
             import fcntl
@@ -125,3 +126,10 @@ class recovery_guard:  # noqa: N801 - used as a context manager
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
+
+
+class recovery_guard(blocking_lock):  # noqa: N801 - used as a context manager
+    """Serialises crash recovery between processes starting at the same moment."""
+
+    def __init__(self, home: Path):
+        super().__init__(Path(home) / ".restore-recovery.lock")

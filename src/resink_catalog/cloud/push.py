@@ -18,7 +18,11 @@ Choices where the contract and the design are silent (L5a):
   the client aborts it and opens its own, once. Anything else is shown to the user.
 - More snapshots or files than `/capabilities` allows in one session: consecutive sessions, oldest snapshots first.
 - `422 checksum_mismatch`: the file is sent once more from 0, then the push fails.
-- A lost connection is retried like 429/503, within the same 5-minute budget (every call is safe to repeat).
+- A lost connection is retried like 429/503, within the same 5-minute budget (every push call is safe to repeat).
+- The idempotency chain's position (the last ended session) is kept in catalog.db (`push_chain`), so it keeps
+  advancing across reruns; it is only an optimisation: without it the chain is walked from the start.
+- push_id has no format in the contract: the client accepts unreserved URL characters only (one path segment).
+- A first push of a table whose oldest snapshots were expired is refused (the deltas would miss live files).
 - `over_included` admission: the CLI asks (or `--yes`); without a terminal it cancels and aborts the session.
 - The commit is polled every second for up to 15 minutes (a commit runs at most 10).
 """
@@ -27,12 +31,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError
 from pyiceberg.manifest import DataFileContent, FileFormat, ManifestContent, ManifestEntryStatus
@@ -47,7 +53,11 @@ DEFAULT_CHUNK_BYTES = 8 * 1024 * 1024  # section 7: default 8 MiB, within the bo
 HASH_BLOCK = 1024 * 1024
 POLL_SECONDS = 1.0
 COMMIT_WAIT_SECONDS = 15 * 60  # a commit runs at most 10 minutes (section 7)
-SESSION_ATTEMPTS = 5
+SESSION_ATTEMPTS = 20  # ended sessions walked per run; the chain position is kept in catalog.db, so reruns go on
+MAX_STALLS = 3  # upload answers in a row that do not move a file forward
+# The contract gives push_id no format: accept only unreserved URL characters, so it is always one path segment.
+PUSH_ID = re.compile(r"^[A-Za-z0-9._~-]{1,128}$")
+FILE_ID = re.compile(r"^[0-9a-f]{64}$")  # the contract's FileId
 ENDED = ("expired", "aborted", "failed")
 
 
@@ -76,18 +86,49 @@ class PushReport:
 # ----------------------------------------------------------------------------------------------- local planning
 
 
-def ancestry(table) -> list:
-    """The main branch's snapshots, oldest first."""
+def ancestry(table) -> tuple[list, bool]:
+    """The main branch's snapshots, oldest first, and whether that history is complete. It is not when older
+    snapshots were expired: the oldest retained one then names a parent that is gone, or (PyIceberg's expiry clears
+    the parent id) its manifests still list live files that an earlier snapshot added."""
     out, snap = [], table.current_snapshot()
+    complete = True
     while snap is not None:
         out.append(snap)
-        snap = table.snapshot_by_id(snap.parent_snapshot_id) if snap.parent_snapshot_id is not None else None
-    return out[::-1]
+        if snap.parent_snapshot_id is None:
+            break
+        parent = table.snapshot_by_id(snap.parent_snapshot_id)
+        if parent is None:
+            complete = False
+        snap = parent
+    out.reverse()
+    if complete and out:
+        root = out[0]
+        complete = all(
+            entry.status == ManifestEntryStatus.ADDED and entry.snapshot_id == root.snapshot_id
+            for manifest in root.manifests(table.io)
+            for entry in manifest.fetch_manifest_entry(table.io, discard_deleted=True)
+        )
+    return out, complete
 
 
 def new_snapshots(table, cloud_last: int | None) -> list:
-    history = ancestry(table)
+    history, complete = ancestry(table)
     if cloud_last is None:
+        if not complete:
+            # The oldest retained snapshot's delta would leave out every file added before it that is still live:
+            # the cloud table would silently miss data. v0 sends deltas only, so refuse.
+            raise CloudError(
+                "incomplete local history",
+                {
+                    "title": "Incomplete local history",
+                    "detail": f"the table's history starts at snapshot {history[0].snapshot_id}: older snapshots "
+                    "were expired. A first push needs the table's whole history, else data files added by the "
+                    "expired snapshots would be missing in the cloud. Nothing was sent.",
+                    "resolution": [
+                        {"action": "use_new_table_name", "detail": "copy the table to a new local table and push that"}
+                    ],
+                },
+            )
         return history
     ids = [s.snapshot_id for s in history]
     if cloud_last not in ids:
@@ -237,6 +278,53 @@ def push_state(cat: Catalog, table: str | None = None) -> list[dict]:
         return [dict(r) for r in conn.execute(q, (table,) if table else ())]
 
 
+def load_chain(cat: Catalog, table: str, workspace: str, target: str, digest: str) -> str:
+    with closing(sqlite3.connect(cat.db_path)) as conn:
+        row = conn.execute(
+            "SELECT body_digest, previous FROM push_chain WHERE table_name = ? AND workspace_id = ? AND target = ?",
+            (table, workspace, target),
+        ).fetchone()
+    return row[1] if row and row[0] == digest else ""
+
+
+def save_chain(cat: Catalog, table: str, workspace: str, target: str, digest: str, previous: str) -> None:
+    with closing(sqlite3.connect(cat.db_path)) as conn, conn:
+        conn.execute(
+            "INSERT INTO push_chain (table_name, workspace_id, target, body_digest, previous) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (table_name, workspace_id, target) DO UPDATE SET body_digest = excluded.body_digest, "
+            "previous = excluded.previous",
+            (table, workspace, target, digest, previous),
+        )
+
+
+def push_path(push_id: object, *rest: str) -> str:
+    """/push/v0/pushes/{push_id}[/...]: a server-supplied push_id must be one plain path segment."""
+    if not isinstance(push_id, str) or not PUSH_ID.match(push_id) or set(push_id) <= {"."}:
+        raise CloudError(f"the receiver sent an invalid push_id {push_id!r}")
+    return "/".join(["/push/v0/pushes", quote(push_id, safe=""), *rest])
+
+
+def file_path(push_id: object, file_id: object) -> str:
+    if not isinstance(file_id, str) or not FILE_ID.match(file_id):
+        raise CloudError(f"the receiver sent an invalid file_id {file_id!r}")
+    return push_path(push_id, "files", file_id)
+
+
+def _received(value: object, f: LocalFile) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= f.size:
+        raise CloudError(f"the receiver reported {value!r} bytes received for a file of {f.size} bytes ({f.file_id})")
+    return value
+
+
+def _check_status(status: dict, f: LocalFile) -> int:
+    """The receiver's view of one file must be consistent: within bounds, and complete only when every byte is in."""
+    received = _received(status.get("received_bytes"), f)
+    state = status.get("state")
+    if (state == "complete" and received != f.size) or (state in ("needed", "partial") and received >= f.size):
+        raise CloudError(f"the receiver reported file {f.file_id} as {state!r} with {received} of {f.size} bytes")
+    return received
+
+
 # ----------------------------------------------------------------------------------------------- the protocol
 
 
@@ -262,9 +350,11 @@ class Pusher:
         confirm: Callable[[dict], bool] = lambda admission: False,
         out: Callable[[str], None] = print,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
         chunk_bytes: int = DEFAULT_CHUNK_BYTES,
     ):
         self.cat, self.device, self.confirm, self.out, self.sleep = cat, device, confirm, out, sleep
+        self.clock = clock
         self.chunk_bytes = chunk_bytes
         self.api = Api(
             push_url or device.push_url,
@@ -272,6 +362,7 @@ class Pusher:
             token=device.access_token,
             refresh=device.refresh,
             sleep=sleep,
+            clock=clock,
         )
 
     def close(self) -> None:
@@ -339,7 +430,7 @@ class Pusher:
                 "base_snapshot_id": base,
                 "snapshots": deltas,
             }
-            session = self._open_session(body)
+            session = self._open_session(body, report)
             if session is None:  # the receiver says nothing is new
                 break
             report.sessions.append(session["push_id"])
@@ -351,8 +442,10 @@ class Pusher:
             record_push_state(self.cat, local, ws, report.target, base, report.cloud_table_id)
         return report
 
-    def _open_session(self, body: dict) -> dict | None:
-        previous, aborted = "", False
+    def _open_session(self, body: dict, report: PushReport) -> dict | None:
+        digest = hashlib.sha256(_canonical(body)).hexdigest()
+        where = (self.cat, report.table, report.workspace_id, report.target)
+        previous, aborted = load_chain(*where, digest), False
         for _ in range(SESSION_ATTEMPTS):
             key = idempotency_key(self.device.info["device_id"], body, previous)
             r = self.api.request("POST", "/push/v0/pushes", json=body, headers={"Idempotency-Key": key})
@@ -360,30 +453,34 @@ class Pusher:
                 return None
             if r.status_code == 201:
                 s = r.json()
+                push_path(s["push_id"])
                 if s["state"] in ENDED:
                     previous = s["push_id"]
+                    save_chain(*where, digest, previous)  # the next attempt, here or in a rerun, starts after it
                     continue
                 return s
             err = fail(r)
             if err.code == "push_in_progress" and err.problem.get("push_id") and not aborted:
                 # an unfinished session of this device for the same table, made from an older local state
-                other = self.api.request("GET", f"/push/v0/pushes/{err.problem['push_id']}")
+                other = self.api.request("GET", push_path(err.problem["push_id"]))
                 if other.status_code == 200 and other.json()["state"] == "open":
-                    d = self.api.request("DELETE", f"/push/v0/pushes/{err.problem['push_id']}")
+                    d = self.api.request("DELETE", push_path(err.problem["push_id"]))
                     if d.status_code == 204:
                         self.out(f"aborted an unfinished earlier push of this table ({err.problem['push_id']})")
                         aborted = True
                         continue
             raise err
-        raise CloudError("could not open a push session: every attempt found an ended session; try again later")
+        raise CloudError(
+            f"could not open a push session: {SESSION_ATTEMPTS} ended sessions in a row; run push again to continue"
+        )
 
     def _finish_session(self, session: dict, files: dict[str, LocalFile], caps: dict, report: PushReport) -> dict:
         push_id = session["push_id"]
-        session = self._get(f"/push/v0/pushes/{push_id}")  # the receiver's current byte counts: resume from them
+        session = self._get(push_path(push_id))  # the receiver's current byte counts: resume from them
         over = session["admission"]["outcome"] == "over_included"
         if session["state"] == "open":
             if over and not self.confirm(session["admission"]):
-                self.api.request("DELETE", f"/push/v0/pushes/{push_id}")
+                self.api.request("DELETE", push_path(push_id))
                 cost = _money(session["admission"].get("estimated_extra_monthly_cost"))
                 raise CloudError(
                     "push cancelled: it would exceed your organization's included storage "
@@ -391,20 +488,24 @@ class Pusher:
                 )
             chunk = max(caps["chunk_bytes_min"], min(self.chunk_bytes, caps["chunk_bytes_max"]))
             for status in session["files"]:
+                f = files.get(status.get("file_id"))
+                if f is None:
+                    raise CloudError(f"the receiver listed a file this push did not declare: {status.get('file_id')!r}")
+                offset = _check_status(status, f)
                 if status["state"] in ("needed", "partial"):
-                    self._upload(push_id, files[status["file_id"]], status["received_bytes"], chunk, report)
+                    self._upload(push_id, f, offset, chunk, report)
             r = self.api.request(
-                "POST", f"/push/v0/pushes/{push_id}/commit", json={"confirm_over_included": True} if over else None
+                "POST", push_path(push_id, "commit"), json={"confirm_over_included": True} if over else None
             )
             if r.status_code not in (200, 202):
                 raise fail(r)
             session = r.json()
-        deadline = time.monotonic() + COMMIT_WAIT_SECONDS
+        deadline = self.clock() + COMMIT_WAIT_SECONDS
         while session["state"] in ("open", "committing"):
-            if time.monotonic() > deadline:
+            if self.clock() > deadline:
                 raise CloudError(f"the commit of push {push_id} is still running; run push again later to see it end")
             self.sleep(POLL_SECONDS)
-            session = self._get(f"/push/v0/pushes/{push_id}")
+            session = self._get(push_path(push_id))
         if session["state"] == "committed":
             return session.get("result") or {}
         problem = session.get("error") or {"title": f"push {session['state']}"}
@@ -419,9 +520,11 @@ class Pusher:
         raise CloudError(f"push {session['state']}", problem)
 
     def _upload(self, push_id: str, f: LocalFile, offset: int, chunk: int, report: PushReport) -> None:
-        """Chunks from the receiver's offset. Memory stays at one chunk whatever the file size."""
-        path = f"/push/v0/pushes/{push_id}/files/{f.file_id}"
-        restarted = False
+        """Chunks from the receiver's offset. Memory stays at one chunk whatever the file size. Every offset the
+        receiver reports is checked (0 <= offset <= size, `complete` only with every byte), and the upload stops if
+        MAX_STALLS answers in a row do not move the file forward."""
+        path = file_path(push_id, f.file_id)
+        restarted, stalls = False, 0
         with f.io.new_input(f.path).open() as stream:
             while offset < f.size:
                 stream.seek(offset)
@@ -431,20 +534,28 @@ class Pusher:
                     "Content-Type": "application/octet-stream",
                 }
                 r = self.api.request("PATCH", path, content=data, headers=headers)
+                before = offset
                 if r.status_code == 200:
                     status = r.json()
                     report.bytes_uploaded += len(data)
-                    offset = status["received_bytes"]
+                    offset = _check_status(status, f)
                     if status["state"] in ("complete", "present"):
                         break
-                    continue
-                err = fail(r)
-                if err.code == "offset_mismatch" and "received_bytes" in err.problem:
-                    offset = int(err.problem["received_bytes"])
-                elif err.code == "checksum_mismatch" and not restarted:
-                    restarted, offset = True, 0  # the receiver reset the file; send it once more
                 else:
-                    raise err
+                    err = fail(r)
+                    if err.code == "offset_mismatch" and "received_bytes" in err.problem:
+                        offset = _received(err.problem["received_bytes"], f)
+                    elif err.code == "checksum_mismatch" and not restarted:
+                        restarted, offset = True, 0  # the receiver reset the file; send it once more
+                        continue
+                    else:
+                        raise err
+                stalls = stalls + 1 if offset <= before else 0
+                if stalls >= MAX_STALLS:
+                    raise CloudError(
+                        f"the upload of {f.file_id} makes no progress (the receiver stays at {offset} of {f.size} "
+                        "bytes); run push again later"
+                    )
         report.files_uploaded += 1
 
 

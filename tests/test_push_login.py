@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx2
 import pytest
 from fake_cloud import ACCOUNTS, PUSH, browser
-from push_helpers import make_pusher, rows
+from push_helpers import Sleeps, make_pusher, rows
 
 from resink_catalog.cloud.http import Api, CloudError
 from resink_catalog.cloud.signin import CallbackListener, Device, LoginError, login, logout, pkce
@@ -171,7 +171,8 @@ def test_logout_keeps_the_tokens_when_accounts_cannot_be_reached(device, store):
     def down(req):
         raise httpx2.ConnectError("down")
 
-    device.transport, device.sleep = httpx2.MockTransport(down), lambda s: None
+    t = Sleeps()
+    device.transport, device.sleep, device.clock = httpx2.MockTransport(down), t.append, t.clock
     device.info["access_expires_at"] = 1e12
     with pytest.raises(CloudError, match="cannot reach"):
         logout(device)

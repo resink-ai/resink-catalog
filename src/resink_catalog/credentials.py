@@ -1,7 +1,8 @@
 """Where the push client keeps its device tokens (push protocol section 3, decision 11).
 
 macOS Keychain and Windows Credential Manager through the `keyring` package, with the native backend chosen
-explicitly. Where there is none (Linux) the program refuses, unless the user opts in to a 0600 file.
+explicitly. On Linux (no native store) a 0600 file in a 0700 directory, with a warning logged once (decision 11).
+If the native store fails on macOS the program refuses unless the user opts in to that file; on Windows it refuses.
 Never in `catalog.db` (users back that up and share it) and never in the data directory that `backup` copies.
 """
 
@@ -112,27 +113,47 @@ def _native_backend(platform: str):
     raise NoSecureStore(f"this program has no OS credential store for platform {platform!r}")
 
 
+_warned = False
+
+
+def _warn_once(message: str, *args) -> None:
+    global _warned
+    if not _warned:
+        _warned = True
+        log.warning(message, *args)
+
+
 def open_store(platform: str | None = None, env: dict | None = None) -> TokenStore:
-    """The OS credential store (macOS Keychain, Windows Credential Manager), chosen explicitly. If it cannot be used
-    (Linux, a missing package, no usable backend) this raises NoSecureStore. Tokens go into the 0600 file in the
-    user's config directory only when the user sets RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS=1; that logs a
-    warning, and is refused on Windows, where this code sets no access control list."""
+    """The OS credential store (macOS Keychain, Windows Credential Manager), chosen explicitly. On Linux, where
+    there is none, the 0600 file in the user's config directory (push protocol decision 11), with a warning logged
+    once. If the native store cannot be used on macOS this raises NoSecureStore unless the user sets
+    RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS=1; on Windows, where this code sets no access control list, the file
+    is never used."""
     platform = platform or sys.platform
     env = os.environ if env is None else env
+    if platform not in ("darwin", "win32"):
+        _warn_once(
+            "no OS credential store on %s: device tokens are kept in a file readable only by you (mode 0600)", platform
+        )
+        return FileStore()
     reason = ""
     try:
         backend, kind = _native_backend(platform)
         if backend.priority <= 0:  # keyring's own "not usable here" signal (raises or returns <= 0)
             raise RuntimeError("backend reports itself unavailable")
         return KeyringStore(backend, kind)
-    except Exception as e:  # ImportError, NoSecureStore, a backend that cannot start
+    except Exception as e:  # ImportError, a backend that cannot start
         reason = f"{type(e).__name__}: {e}"
     if env.get(PLAINTEXT_ENV) == "1" and platform != "win32":
-        log.warning(
+        _warn_once(
             "storing credentials in a plaintext file (mode 0600) because %s=1; reason: %s", PLAINTEXT_ENV, reason
         )
         return FileStore()
     raise NoSecureStore(
-        f"no secure credential store is available ({reason}). Set {PLAINTEXT_ENV}=1 to store tokens in a "
-        "file readable only by you instead (not available on Windows)."
+        f"no secure credential store is available ({reason})."
+        + (
+            f" Set {PLAINTEXT_ENV}=1 to store tokens in a file readable only by you instead."
+            if platform != "win32"
+            else ""
+        )
     )

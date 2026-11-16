@@ -59,6 +59,15 @@ CREATE TABLE IF NOT EXISTS push_state (
     pushed_at TEXT NOT NULL,
     PRIMARY KEY (table_name, workspace_id, target)
 );
+-- push client: the last ended session of the idempotency chain for the body being pushed (push.py)
+CREATE TABLE IF NOT EXISTS push_chain (
+    table_name TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    target TEXT NOT NULL,
+    body_digest TEXT NOT NULL,
+    previous TEXT NOT NULL,
+    PRIMARY KEY (table_name, workspace_id, target)
+);
 """
 
 

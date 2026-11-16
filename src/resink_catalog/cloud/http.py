@@ -2,15 +2,16 @@
 
 Client behaviour from the design: retry `429` and `503` with exponential backoff, up to 5 minutes in total, honouring
 `Retry-After`; never retry another 4xx (the callers handle `409 offset_mismatch` themselves); print the problem's
-`title`, `detail` and first `resolution` verbatim. A lost connection is retried within the same budget: every call the
-client makes is safe to repeat (sessions are idempotent on their key, a repeated chunk gets `409 offset_mismatch`,
-commit is idempotent).
+`title`, `detail` and first `resolution` verbatim. A lost connection is retried within the same budget: every push call
+is safe to repeat (sessions are idempotent on their key, a repeated chunk gets `409 offset_mismatch`, commit is
+idempotent). Token exchanges are not: they are retried only when the connection could not be made at all.
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from urllib.parse import urlsplit
 
 import httpx2
 
@@ -79,20 +80,39 @@ def retry_after(r: httpx2.Response) -> float | None:
         return None
 
 
-class Backoff:
-    """Exponential backoff (1, 2, 4 ... 60 seconds, or the server's Retry-After if longer) within a total budget."""
+LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 
-    def __init__(self, sleep: Callable[[float], None], budget: float = RETRY_BUDGET_SECONDS):
-        self.sleep, self.budget, self.spent, self.n = sleep, budget, 0.0, 0
+
+def check_url(url: str) -> str:
+    """Credentials only travel over https; plain http is allowed to a loopback host only (tests, local development)."""
+    u = urlsplit(url)
+    if u.scheme == "https" and u.hostname:
+        return url.rstrip("/")
+    if u.scheme == "http" and u.hostname in LOOPBACK_HOSTS:
+        return url.rstrip("/")
+    raise CloudError(f"refusing cloud address {url!r}: it must be https:// (http:// only to 127.0.0.1 or localhost)")
+
+
+class Backoff:
+    """Exponential backoff (1, 2, 4 ... 60 seconds, or the server's Retry-After if longer) within a deadline that
+    also counts the time spent in requests (`clock` is monotonic)."""
+
+    def __init__(
+        self, sleep: Callable[[float], None], clock: Callable[[], float], budget: float = RETRY_BUDGET_SECONDS
+    ):
+        self.sleep, self.clock, self.n = sleep, clock, 0
+        self.deadline = clock() + budget
+
+    def remaining(self) -> float:
+        return self.deadline - self.clock()
 
     def wait(self, server_delay: float | None) -> bool:
         delay = max(server_delay or 0.0, min(2.0**self.n, MAX_DELAY_SECONDS))
-        if self.spent + delay > self.budget:
+        if delay >= self.remaining():
             return False
         self.sleep(delay)
-        self.spent += delay
         self.n += 1
-        return True
+        return self.remaining() > 0
 
 
 class Api:
@@ -104,12 +124,13 @@ class Api:
         *,
         transport: httpx2.BaseTransport | None = None,
         token: Callable[[], str] | None = None,
-        refresh: Callable[[], None] | None = None,
+        refresh: Callable[[str], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ):
-        self.base_url = base_url.rstrip("/")
+        self.base_url = check_url(base_url)
         self.client = httpx2.Client(base_url=self.base_url, transport=transport, timeout=TIMEOUT)
-        self.token, self.refresh, self.sleep = token, refresh, sleep
+        self.token, self.refresh, self.sleep, self.clock = token, refresh, sleep, clock
 
     def close(self) -> None:
         self.client.close()
@@ -120,23 +141,38 @@ class Api:
     def __exit__(self, *exc) -> None:
         self.close()
 
-    def request(self, method: str, path: str, *, headers: dict | None = None, **kw) -> httpx2.Response:
-        backoff = Backoff(self.sleep)
+    def request(
+        self, method: str, path: str, *, headers: dict | None = None, once: bool = False, **kw
+    ) -> httpx2.Response:
+        """`once`: for requests that must not be repeated after they may have reached the server (token exchanges:
+        a code is single use, and a resent refresh token counts as reuse and revokes the device). Only a failure to
+        connect, where nothing was sent, is retried."""
+        backoff = Backoff(self.sleep, self.clock)
         refreshed = False
         while True:
             h = dict(headers or {})
+            sent_token = None
             if self.token is not None:
-                h["Authorization"] = f"Bearer {self.token()}"
+                sent_token = self.token()
+                h["Authorization"] = f"Bearer {sent_token}"
+            remaining = backoff.remaining()
+            if remaining <= 0:
+                raise CloudError(f"gave up on {self.base_url} after {RETRY_BUDGET_SECONDS:.0f} seconds")
+            timeout = httpx2.Timeout(min(TIMEOUT.read, remaining), connect=min(TIMEOUT.connect, remaining))
             try:
-                r = self.client.request(method, path, headers=h, **kw)
-            except httpx2.TransportError as e:
+                r = self.client.request(method, path, headers=h, timeout=timeout, **kw)
+            except (httpx2.ConnectError, httpx2.ConnectTimeout) as e:
                 if backoff.wait(None):
                     continue
                 raise CloudError(f"cannot reach {self.base_url}: {e}") from e
-            if r.status_code in RETRY_STATUSES and backoff.wait(retry_after(r)):
+            except httpx2.TransportError as e:
+                if not once and backoff.wait(None):
+                    continue
+                raise CloudError(f"lost the connection to {self.base_url}: {e}") from e
+            if not once and r.status_code in RETRY_STATUSES and backoff.wait(retry_after(r)):
                 continue
             if r.status_code == 401 and self.refresh is not None and not refreshed:
                 refreshed = True
-                self.refresh()
+                self.refresh(sent_token)
                 continue
             return r

@@ -22,8 +22,8 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import httpx2
 from openapi_contract import check_request, check_response
 
-ACCOUNTS = "http://accounts.test"
-PUSH = "http://push.test"
+ACCOUNTS = "https://accounts.test"
+PUSH = "https://push.test"
 LOOPBACK = re.compile(r"^http://127\.0\.0\.1:([0-9]{1,5})/callback$")  # accounts' own rule (A8, devices.py)
 
 
@@ -112,6 +112,7 @@ class FakeCloud:
         self.faults: list[tuple[str, str, httpx2.Response]] = []  # (method, path regex, response), each used once
         self.kill_after_chunks: int | None = None
         self.over_included = False
+        self.end_new_sessions = 0
         self.patch_delay = 0.0  # seconds per chunk, served mode only
         self.check_requests = True  # off only where a test sends a request the contract forbids on purpose
         self.unchecked: list[str] = []  # exchanges deliberately not checked against the YAML (known deviations)
@@ -339,6 +340,9 @@ class FakeCloud:
                 "estimated_extra_monthly_cost": {"amount": "0.02", "currency": "USD"},
             }
         s = Session(f"push_{len(self.sessions) + 1}", device.id, ws, body["table"], body, files, admission)
+        if self.end_new_sessions > 0:  # the session expires before the client gets to it
+            self.end_new_sessions -= 1
+            s.state = "expired"
         self.sessions[s.push_id] = s
         self.idem[(device.id, key)] = (digest, s.push_id)
         return _json(201, self._view(s))
