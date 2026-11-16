@@ -72,6 +72,10 @@ def test_on_windows_files_are_flushed_through_a_writable_handle_and_directories_
         "open",
         lambda path, flags, *a, **k: (opened.append((str(path), flags)), real_open(path, flags, *a, **k))[1],
     )
+    # record the flushes instead of making them: the simulated-POSIX half fsyncs a read-only handle, which the real
+    # Windows runner refuses (EBADF), and the test is about which handles are opened
+    flushed = []
+    monkeypatch.setattr(rj.os, "fsync", flushed.append)
 
     monkeypatch.setattr(rj, "_POSIX", False)
     rj.fsync_file(f)
@@ -84,6 +88,7 @@ def test_on_windows_files_are_flushed_through_a_writable_handle_and_directories_
     rj.fsync_dir(tmp_path)
     assert [p for p, _ in opened] == [str(f), str(tmp_path)]
     assert not opened[0][1] & os.O_RDWR  # POSIX: read-only handle
+    assert len(flushed) == 3  # the file once per mode, the directory on POSIX
 
 
 @pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs a file the user cannot open for writing")
