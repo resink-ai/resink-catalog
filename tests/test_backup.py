@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -583,9 +584,11 @@ def test_the_durability_order_staged_data_then_journal_then_renames_with_both_pa
     assert len(renames) == 4 and renames[0] > first_journal  # no rename before the journal is durable
     assert events[kinds.index("journal", first_journal + 1)] == ("journal", "committed")
     assert kinds.index("journal", first_journal + 1) > renames[-1]  # the marker comes after every rename
-    # each rename is followed by an fsync of its parent directory (both, when they differ) before the next step
-    for i in renames:
-        assert events[i + 1][0] == "fsync_dir"
+    # POSIX: each rename is followed by an fsync of its parent directory (both, when they differ) before the next
+    # step. Windows has no directory fsync; there the rename itself is write-through (test_windows_paths).
+    if sys.platform != "win32":
+        for i in renames:
+            assert events[i + 1][0] == "fsync_dir"
     assert not list(home.glob(".restore-journal.json"))  # removed last
 
 
