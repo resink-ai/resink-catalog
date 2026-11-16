@@ -9,11 +9,13 @@ idempotent). Token exchanges are not: they are retried only when the connection 
 
 from __future__ import annotations
 
+import socket
 import threading
 import time
 from collections.abc import Callable
 from urllib.parse import urlsplit
 
+import httpcore2
 import httpx2
 
 RETRY_STATUSES = (429, 503)
@@ -120,6 +122,59 @@ class Backoff:
         return self.remaining() > 0
 
 
+class _Cuttable(httpcore2.NetworkStream):
+    """A network stream whose socket the owner can shut down from another thread."""
+
+    def __init__(self, inner: httpcore2.NetworkStream, backend: _CuttingBackend):
+        self._inner, self._backend = inner, backend
+        backend.streams.add(self)
+
+    def read(self, max_bytes, timeout=None):
+        return self._inner.read(max_bytes, timeout)
+
+    def write(self, buffer, timeout=None):
+        self._inner.write(buffer, timeout)
+
+    def close(self):
+        self._backend.streams.discard(self)
+        self._inner.close()
+
+    def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+        self._backend.streams.discard(self)  # the TLS stream owns the socket from now on
+        return _Cuttable(self._inner.start_tls(ssl_context, server_hostname, timeout), self._backend)
+
+    def get_extra_info(self, info):
+        return self._inner.get_extra_info(info)
+
+    def cut(self) -> None:
+        sock = self._inner.get_extra_info("socket")
+        try:
+            sock.shutdown(socket.SHUT_RDWR)  # wakes a read blocked in another thread; close() alone does not
+        except (OSError, AttributeError):
+            pass
+
+
+class _CuttingBackend(httpcore2.NetworkBackend):
+    """httpcore's own blocking backend, keeping track of the open streams so that `cut_all` can stop them."""
+
+    def __init__(self):
+        self._inner = httpcore2.SyncBackend()
+        self.streams: set[_Cuttable] = set()
+
+    def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        return _Cuttable(self._inner.connect_tcp(host, port, timeout, local_address, socket_options), self)
+
+    def connect_unix_socket(self, path, timeout=None, socket_options=None):  # pragma: no cover - not used
+        return _Cuttable(self._inner.connect_unix_socket(path, timeout, socket_options), self)
+
+    def sleep(self, seconds):  # pragma: no cover - used by httpcore retries only
+        self._inner.sleep(seconds)
+
+    def cut_all(self) -> None:
+        for stream in list(self.streams):
+            stream.cut()
+
+
 class Api:
     """One cloud service. `token` gives the current bearer token; `refresh` gets a new one after a 401 (once)."""
 
@@ -135,14 +190,41 @@ class Api:
         budget: float = RETRY_BUDGET_SECONDS,
     ):
         self.base_url = check_url(base_url)
-        self.client = httpx2.Client(base_url=self.base_url, transport=transport, timeout=TIMEOUT)
+        self._transport = transport
         self.token, self.refresh, self.sleep, self.clock = token, refresh, sleep, clock
         self.budget = budget
+        self._new_client()
+
+    def _new_client(self) -> None:
+        """A client whose connections can be cut from another thread (network transport only; a transport passed
+        in by a caller, such as a test's fake, is reused as it is)."""
+        self._backend: _CuttingBackend | None = None
+        transport = self._transport
+        if transport is None:
+            transport = httpx2.HTTPTransport()
+            pool = getattr(transport, "_pool", None)
+            if pool is not None and hasattr(pool, "_network_backend"):  # httpcore's ConnectionPool
+                self._backend = _CuttingBackend()
+                pool._network_backend = self._backend
+        self.client = httpx2.Client(base_url=self.base_url, transport=transport, timeout=TIMEOUT)
+
+    def _abandon(self, worker: threading.Thread) -> None:
+        """Cancel a request that ran past its deadline: shut its sockets down (so the worker's blocked read fails
+        and the thread exits), close the client, and use a fresh one for later calls."""
+        old, backend = self.client, self._backend
+        if backend is not None:
+            backend.cut_all()
+        try:
+            old.close()
+        except Exception:  # noqa: BLE001 - closing under a failing request may raise; the client is discarded
+            pass
+        self._new_client()
+        worker.join(0.2)  # usually enough for the cut read to fail; never wait long on a transport that cannot be cut
 
     def _send(self, limit: float, method: str, path: str, **kw) -> httpx2.Response:
         """One request, headers and body read in full, within an absolute `limit` in seconds. Per-read timeouts
-        alone do not bound a response that trickles bytes, so the request runs in a worker thread and is abandoned
-        (its connection is never reused for this call) when the limit passes."""
+        alone do not bound a response that trickles bytes, so the request runs in a worker thread; when the limit
+        passes, its connection is cut and the client replaced (`_abandon`)."""
         out: dict = {}
 
         def run() -> None:
@@ -155,6 +237,7 @@ class Api:
         worker.start()
         worker.join(max(limit, 0.0))
         if worker.is_alive():
+            self._abandon(worker)
             raise RequestMaybeSent(f"no complete answer from {self.base_url} within the time limit")
         if "error" in out:
             raise out["error"]

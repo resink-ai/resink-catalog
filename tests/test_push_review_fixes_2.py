@@ -219,3 +219,65 @@ def test_4_a_hanging_transport_is_abandoned_at_the_deadline():
         with pytest.raises(RequestMaybeSent, match="time limit"):
             api.request("GET", "/push/v0/capabilities")
     assert time.monotonic() - start < 1.5
+
+
+# ---------------------------------------------------------------- round 3: the abandoned request is cancelled for real
+
+
+def _http_workers():
+    return [t for t in threading.enumerate() if t.name == "resink-catalog-http" and t.is_alive()]
+
+
+def test_r3_at_the_deadline_the_connection_is_cut_and_the_worker_exits():
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    closed = threading.Event()
+    stop = threading.Event()
+
+    def trickle():  # never stops on its own: only the client closing the connection ends it
+        conn, _ = srv.accept()
+        conn.recv(65536)
+        try:
+            for b in b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n" + b"x" * 1000000:
+                if stop.is_set():
+                    return
+                conn.sendall(bytes([b]))
+                time.sleep(1.5)  # each byte within the per-read timeout (2 s), so only a cut ends the read early
+        except OSError:
+            closed.set()  # the client's side is gone
+        finally:
+            conn.close()
+
+    server = threading.Thread(target=trickle, daemon=True)
+    server.start()
+    try:
+        api = Api(f"http://127.0.0.1:{srv.getsockname()[1]}", budget=2.0)
+        first = api.client
+        with pytest.raises(RequestMaybeSent):
+            api.request("GET", "/push/v0/capabilities")
+        deadline = time.monotonic() + 0.3  # far less than the second until the next byte would wake the read
+        while _http_workers() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert _http_workers() == []  # the blocked read failed and the worker returned
+        assert closed.wait(3)  # the server saw the connection closed while it was still sending
+        assert api.client is not first  # later calls get a fresh client
+        api.close()
+    finally:
+        stop.set()
+        srv.close()
+
+
+def test_r3_later_calls_on_the_same_api_work_after_an_abandoned_one():
+    calls = []
+
+    def handler(req):
+        calls.append(req.url.path)
+        if len(calls) == 1:
+            time.sleep(1.5)  # the fake cannot be cut; it just finishes late
+        return httpx2.Response(200, json={"ok": True})
+
+    with Api("https://push.example", transport=httpx2.MockTransport(handler), budget=0.5) as api:
+        with pytest.raises(RequestMaybeSent):
+            api.request("GET", "/a")
+        assert api.request("GET", "/b").json() == {"ok": True}
