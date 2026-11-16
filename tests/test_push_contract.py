@@ -250,3 +250,22 @@ def test_commit_of_an_over_included_session_needs_confirmation(spec):
     assert list(v.iter_errors({"confirm_over_included": "yes"})) and list(v.iter_errors({"confirm": True}))
     problem = spec["components"]["schemas"]["Problem"]["properties"]
     assert "estimated_extra_monthly_cost" in problem  # the refusal names the cost
+
+
+def test_no_schema_has_a_stray_null_key():
+    """A flow mapping like `{description: One, two.}` silently becomes the key `two.` with no value (the comma ends the
+    plain scalar). No key of the contract may be a sentence with a null value."""
+    found = []
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if v is None and isinstance(k, str) and " " in k:
+                    found.append(f"{path}/{k}")
+                walk(v, f"{path}/{k}")
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                walk(v, f"{path}/{i}")
+
+    walk(yaml.safe_load(CONTRACT.read_text()), "")
+    assert found == []

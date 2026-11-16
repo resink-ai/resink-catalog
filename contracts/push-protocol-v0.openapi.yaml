@@ -687,7 +687,7 @@ components:
             - $ref: '#/components/schemas/StorageUse'
             - type: object
               properties:
-                included_bytes: {type: integer, format: int64, description: The plan's included storage, counted once per org.}
+                included_bytes: {type: integer, format: int64, description: "The plan's included storage, counted once per org."}
         workspace: {$ref: '#/components/schemas/StorageUse'}
         over_included_bytes: {type: integer, format: int64, description: Set with `over_included`.}
         estimated_extra_monthly_cost:
