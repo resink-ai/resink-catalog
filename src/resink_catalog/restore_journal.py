@@ -46,14 +46,10 @@ _POSIX = os.name == "posix"
 
 def fsync_file(path: Path) -> None:
     """Flush a file's data to disk. Windows only flushes a handle that was opened for writing (`fsync` on a read-only
-    one fails with EBADF), so it gets one; a file that cannot be opened for writing is read-only and was not changed."""
-    if _POSIX:
-        fd = os.open(path, os.O_RDONLY)
-    else:
-        try:
-            fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
-        except PermissionError:
-            return
+    one fails with EBADF), so it gets one. If that cannot be opened, the error is raised: not being able to flush a
+    file is not evidence that it is already durable, and restore must stop rather than carry on without it."""
+    flags = os.O_RDONLY if _POSIX else os.O_RDWR | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags)
     try:
         os.fsync(fd)
     finally:

@@ -637,17 +637,30 @@ def test_an_uncertain_commit_marker_is_never_rolled_back_in_process(cat, home, t
     ("location", "expected"),
     [
         ("file:///C:/Users/x/warehouse/a/b.json", "C:/Users/x/warehouse/a/b.json"),  # what an old pyiceberg stored
-        ("C:\\Users\\x\\warehouse\\a\\b.json", "C:\\Users\\x\\warehouse\\a\\b.json"),  # plain drive path (Windows)
+        ("C:\\Users\\x\\warehouse\\a\\b.json", "C:\\Users\\x\\warehouse\\a\\b.json"),  # plain drive path
         ("C:/Users/x/warehouse/a b.json", "C:/Users/x/warehouse/a b.json"),
         ("file:///C:/Users/x/a%20b.json", "C:/Users/x/a b.json"),
         ("file:///home/x/warehouse/a.json", "/home/x/warehouse/a.json"),
+    ],
+)
+def test_local_path_reads_windows_locations_on_windows(location, expected):
+    from resink_catalog.backup import _local_path
+
+    assert str(_local_path(location, windows=True)).replace("\\", "/") == expected.replace("\\", "/")
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("file:///C:/warehouse/a.json", "/C:/warehouse/a.json"),  # an absolute path whose first directory is `C:`
+        ("file:///home/x/warehouse/a%20b.json", "/home/x/warehouse/a b.json"),
         ("/home/x/warehouse/a.json", "/home/x/warehouse/a.json"),
     ],
 )
-def test_local_path_reads_windows_and_posix_locations_alike(location, expected):
+def test_local_path_keeps_posix_semantics_on_posix(location, expected):
     from resink_catalog.backup import _local_path
 
-    assert str(_local_path(location)).replace("\\", "/") == expected.replace("\\", "/")
+    assert _local_path(location, windows=False).as_posix() == expected
 
 
 def test_local_path_refuses_remote_locations():

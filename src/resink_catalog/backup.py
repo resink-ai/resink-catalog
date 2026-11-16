@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -41,16 +42,18 @@ class BackupError(Exception):
 _DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
-def _local_path(uri: str) -> Path:
+def _local_path(uri: str, *, windows: bool | None = None) -> Path:
     """The local path of a stored location: a `file:` URI (`file:///C:/x` or `file:///home/x`) or a plain path
-    (`C:\\x` on Windows, where PyIceberg's warehouse is one). Decided by the text, so it behaves the same everywhere."""
-    if _DRIVE.match(uri):  # `C:\x`: urlparse would take `C` for a scheme
+    (`C:\\x` on Windows, where PyIceberg's warehouse is one). The drive form is only read as a drive on Windows; on
+    POSIX `file:///C:/x` is the absolute path `/C:/x`."""
+    windows = os.name == "nt" if windows is None else windows
+    if windows and _DRIVE.match(uri):  # `C:\x`: urlparse would take `C` for a scheme
         return Path(uri)
     parsed = urlparse(uri)
     if parsed.scheme not in ("", "file"):
         raise BackupError(f"cannot back up {uri}: only local files are supported")
     path = unquote(parsed.path)
-    if re.match(r"^/[A-Za-z]:[\\/]", path):  # file:///C:/x -> C:/x
+    if windows and re.match(r"^/[A-Za-z]:[\\/]", path):  # file:///C:/x -> C:/x
         path = path[1:]
     return Path(path)
 
