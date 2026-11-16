@@ -1,6 +1,7 @@
 """Windows behaviour that can be checked anywhere. The real thing runs in CI (windows-latest)."""
 
-from pathlib import Path, PureWindowsPath
+import os
+from pathlib import PurePosixPath, PureWindowsPath
 
 import pytest
 
@@ -14,7 +15,10 @@ def test_the_warehouse_is_a_plain_drive_path_on_windows_and_a_file_uri_elsewhere
         warehouse_location(PureWindowsPath("C:/Users/me/home/warehouse"), windows=True)
         == "C:\\Users\\me\\home\\warehouse"
     )  # type: ignore[arg-type]
-    assert warehouse_location(Path("/home/me/warehouse"), windows=False) == "file:///home/me/warehouse"
+    assert (
+        warehouse_location(PurePosixPath("/home/me/warehouse"), windows=False)  # type: ignore[arg-type]
+        == "file:///home/me/warehouse"
+    )
 
 
 def test_pyiceberg_understands_what_the_windows_branch_hands_it(monkeypatch):
@@ -47,3 +51,47 @@ def test_an_empty_or_blank_csv_is_still_refused(tmp_path):
     f.write_bytes(b"\r\r\n")
     with pytest.raises(ReadError):
         read_csv(f)
+
+
+# ------------------------------------------------------------------------- durability calls on Windows (simulated)
+
+
+def test_on_windows_files_are_flushed_through_a_writable_handle_and_directories_are_skipped(tmp_path, monkeypatch):
+    """Windows cannot fsync a read-only handle (EBADF) or open a directory; the NTFS journal covers renames. The same
+    code keeps the POSIX behaviour (read-only handle, directory fsync). `_POSIX` is switched to simulate each."""
+    import os
+
+    from resink_catalog import restore_journal as rj
+
+    f = tmp_path / "data.bin"
+    f.write_bytes(b"x")
+    opened = []
+    real_open = os.open
+    monkeypatch.setattr(
+        rj.os,
+        "open",
+        lambda path, flags, *a, **k: (opened.append((str(path), flags)), real_open(path, flags, *a, **k))[1],
+    )
+
+    monkeypatch.setattr(rj, "_POSIX", False)
+    rj.fsync_file(f)
+    rj.fsync_dir(tmp_path)  # nothing is opened for a directory
+    assert [p for p, _ in opened] == [str(f)] and opened[0][1] & os.O_RDWR
+
+    opened.clear()
+    monkeypatch.setattr(rj, "_POSIX", True)
+    rj.fsync_file(f)
+    rj.fsync_dir(tmp_path)
+    assert [p for p, _ in opened] == [str(f), str(tmp_path)]
+    assert not opened[0][1] & os.O_RDWR  # POSIX: read-only handle
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs a file the user cannot open for writing")
+def test_on_windows_a_read_only_file_is_skipped_not_an_error(tmp_path, monkeypatch):
+    from resink_catalog import restore_journal as rj
+
+    f = tmp_path / "ro.bin"
+    f.write_bytes(b"x")
+    f.chmod(0o444)
+    monkeypatch.setattr(rj, "_POSIX", False)
+    rj.fsync_file(f)  # PermissionError is swallowed: it was not modified

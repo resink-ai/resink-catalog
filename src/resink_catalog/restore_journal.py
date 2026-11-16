@@ -41,8 +41,19 @@ def _hook(point: str) -> None:
     """Named points in recovery and rollback; tests replace this to kill the process at each of them."""
 
 
+_POSIX = os.name == "posix"
+
+
 def fsync_file(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
+    """Flush a file's data to disk. Windows only flushes a handle that was opened for writing (`fsync` on a read-only
+    one fails with EBADF), so it gets one; a file that cannot be opened for writing is read-only and was not changed."""
+    if _POSIX:
+        fd = os.open(path, os.O_RDONLY)
+    else:
+        try:
+            fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+        except PermissionError:
+            return
     try:
         os.fsync(fd)
     finally:
@@ -50,8 +61,9 @@ def fsync_file(path: Path) -> None:
 
 
 def fsync_dir(path: Path) -> None:
-    """Make a directory's entries (creations, renames, removals) durable. Not possible on Windows: skipped there."""
-    if os.name != "posix":
+    """Make a directory's entries (creations, renames, removals) durable. A directory cannot be opened for fsync on
+    Windows, where the NTFS metadata journal covers renames: skipped there, kept on POSIX."""
+    if not _POSIX:
         return
     fd = os.open(path, os.O_RDONLY)
     try:

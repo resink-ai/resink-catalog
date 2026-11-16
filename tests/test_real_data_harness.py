@@ -44,10 +44,14 @@ def test_a_wrong_number_is_caught(tmp_path, db):
     src = load(db, "orders")
     (tmp_path / "files").mkdir()
     path = export(src, tmp_path / "files", "csv")
-    text = path.read_text().replace(",137.0,", ",138.0,", 1) if ",137.0," in path.read_text() else path.read_text()
+    text = (
+        path.read_text(encoding="utf-8").replace(",137.0,", ",138.0,", 1)
+        if ",137.0," in path.read_text(encoding="utf-8")
+        else path.read_text(encoding="utf-8")
+    )
     lines = text.splitlines()
     lines[5] = lines[5].rsplit(",", 1)[0] + ",999999"  # corrupt the last column of one row
-    path.write_text("\n".join(lines) + "\n")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     out = verify(Catalog(tmp_path / "home"), src, "csv", path)
     assert not out.ok and any("sum" in p for p in out.problems), out.problems
 
@@ -56,7 +60,9 @@ def test_a_lost_distinct_value_is_caught(tmp_path, db):
     src = load(db, "orders")
     (tmp_path / "files").mkdir()
     path = export(src, tmp_path / "files", "csv")
-    path.write_text(path.read_text().replace("Zoë 3", "Zoë 1"))  # two customers merge into one
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("Zoë 3", "Zoë 1"), encoding="utf-8"
+    )  # two customers merge into one
     out = verify(Catalog(tmp_path / "home"), src, "csv", path)
     assert not out.ok and any("distinct" in p for p in out.problems), out.problems
 
@@ -65,8 +71,8 @@ def test_a_missing_row_is_caught(tmp_path, db):
     src = load(db, "orders")
     (tmp_path / "files").mkdir()
     path = export(src, tmp_path / "files", "csv")
-    lines = path.read_text().splitlines(keepends=True)
-    path.write_text("".join(lines[:-1]))
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    path.write_text("".join(lines[:-1]), encoding="utf-8")
     out = verify(Catalog(tmp_path / "home"), src, "csv", path)
     assert not out.ok and any("rows" in p for p in out.problems)
 
