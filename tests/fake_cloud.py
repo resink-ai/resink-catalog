@@ -27,6 +27,12 @@ PUSH = "https://push.test"
 LOOPBACK = re.compile(r"^http://127\.0\.0\.1:([0-9]{1,5})/callback$")  # accounts' own rule (A8, devices.py)
 
 
+def cloud_name(namespace: list, name: str) -> str:
+    """The receiver's naming (push_core `cloud_table_name`, owner's ruling): the workspace is the schema; `main` and
+    `default` are dropped, any other namespace becomes a prefix."""
+    return name if namespace in (["main"], ["default"]) else f"{namespace[0]}__{name}"
+
+
 class Killed(BaseException):
     """Stands in for the client process dying: nothing in the client catches it."""
 
@@ -102,7 +108,7 @@ class FakeCloud:
         self.devices: dict[str, DeviceRec] = {}
         self.access: dict[str, tuple[str, float]] = {}  # token -> (device id, expiry)
         self.refresh: dict[str, dict] = {}  # token -> {"device", "rotated"}
-        self.tables: dict[tuple, CloudTable] = {}
+        self.tables: dict[tuple, CloudTable] = {}  # (workspace, cloud table name) -> table, as in the receiver
         self.blobs: dict[str, dict[str, bytes]] = {}  # workspace -> file_id -> bytes
         self.sessions: dict[str, Session] = {}
         self.idem: dict[tuple, tuple[str, str]] = {}  # (device, key) -> (digest, push_id)
@@ -271,7 +277,7 @@ class FakeCloud:
         return ws in {w["id"] for w in self.workspaces}
 
     def table(self, ws: str, ns: list, name: str) -> CloudTable | None:
-        return self.tables.get((ws, tuple(ns), name))
+        return self.tables.get((ws, cloud_name(ns, name)))
 
     def table_state(self, device, req) -> httpx2.Response:
         ws = req.url.params["workspace_id"]
@@ -416,7 +422,7 @@ class FakeCloud:
             )
         if any(f["state"] not in ("complete", "present") for f in s.files.values()):
             return problem(422, "invalid_parquet", "Files missing", "not every file is uploaded")
-        key = (s.workspace_id, tuple(s.table["namespace"]), s.table["name"])
+        key = (s.workspace_id, cloud_name(s.table["namespace"], s.table["name"]))
         t = self.tables.setdefault(key, CloudTable(str(uuid.uuid4()), s.body["source_table_uuid"]))
         mapping = []
         for snap in s.body["snapshots"]:

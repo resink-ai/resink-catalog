@@ -83,7 +83,7 @@ resink-catalog logout                # revokes this computer's sign-in and delet
 
 `login` uses the authorization code flow with PKCE and a one-time listener on `127.0.0.1` (a random port); it prints the sign-in URL as well, and gives up after 5 minutes. `push` asks the cloud what it already holds for the table, then sends, per newer local snapshot, the data files it added and removed and its schema. An interrupted push (closed laptop, lost network, killed process) resumes when you run it again and sends only the bytes the cloud is missing. The cloud table's name defaults to the local one (`--to NAMESPACE.NAME` changes it) and the workspace to the one chosen at sign-in (`--workspace ID`). Tables with delete files (for example after a DuckDB `DELETE`), partitioning, non-Parquet files or Iceberg format version 3 are refused before anything is sent. The cloud addresses come from `--accounts-url`/`--push-url` at login, or `RESINK_ACCOUNTS_URL`/`RESINK_PUSH_URL`.
 
-In cloud SQL the workspace is the schema, so the local namespace becomes part of the table name: `main.orders` is `main__orders` in the workspace (a table in the namespace `default` keeps its bare name). `push` prints the cloud name.
+In cloud SQL the workspace is the schema, so the local namespace becomes part of the table name: `shop.orders` is `shop__orders` in the workspace, while tables in `main` (the default here) or `default` keep their bare name, so `main.orders` is `orders`. `push` prints the cloud name. Because `main.x` and `default.x` would both be `x`, the second one pushed is refused; push it under another name with `--to`.
 
 ### Push credentials
 

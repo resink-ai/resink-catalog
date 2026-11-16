@@ -84,10 +84,27 @@ class PushReport:
     sessions: list[str] = field(default_factory=list)
 
 
+DEFAULT_NAMESPACES = ("main", "default")  # dropped from cloud names: `main` is ours, `default` PyIceberg's/Spark's
+
+
 def cloud_table_name(namespace: str, name: str) -> str:
     """The receiver's naming (push_core `cloud_table_name`): the workspace is the cloud schema, so the local namespace
-    becomes a prefix, `<namespace>__<name>`, except for `default`, which is dropped."""
-    return name if namespace == "default" else f"{namespace}__{name}"
+    becomes a prefix, `<namespace>__<name>`, except for `main` and `default`, which are dropped. So `main.x` and
+    `default.x` share the cloud name `x`; the second one pushed is refused (see `other_source_problem`)."""
+    return name if namespace in DEFAULT_NAMESPACES else f"{namespace}__{name}"
+
+
+def other_source_problem(local: str, cloud_name: str) -> CloudError:
+    return CloudError(
+        "pushed from another table",
+        {
+            "title": "History diverged",
+            "code": "history_diverged",
+            "detail": f"the cloud table {cloud_name} was pushed from another local table, not from {local} (for "
+            "example `main.x` and `default.x` both become `x` in the cloud). Nothing was sent.",
+            "resolution": [{"action": "use_new_table_name", "detail": "push to a new name with --to NAMESPACE.NAME"}],
+        },
+    )
 
 
 def table_exists_problem(target: str) -> CloudError:
@@ -96,7 +113,8 @@ def table_exists_problem(target: str) -> CloudError:
         {
             "title": "Table exists",
             "code": "table_exists",
-            "detail": f"the cloud workspace already has a table {target} that was not created by a push; "
+            "detail": f"the cloud workspace already has a table {target} that was not created by a push "
+            "(or a push from another local table took that name); "
             "a push never writes into it. Nothing was sent.",
             "resolution": [{"action": "use_new_table_name", "detail": "push to a new name with --to NAMESPACE.NAME"}],
         },
@@ -419,7 +437,10 @@ class Pusher:
         caps = self.capabilities()
         state = self._get("/push/v0/table-state", params={"workspace_id": ws, "namespace": [tns], "name": tname})
         if state.get("exists") and not state.get("push_managed"):  # before any scan or hash of the local table
-            raise table_exists_problem(report.target)
+            raise table_exists_problem(report.cloud_name)
+        source = state.get("source_table_uuid")
+        if state.get("exists") and source and source.lower() != str(table.metadata.table_uuid).lower():
+            raise other_source_problem(local, report.cloud_name)
         cloud_last = state.get("last_pushed_source_snapshot_id") if state.get("exists") else None
         report.cloud_table_id = state.get("cloud_table_id")
         todo = new_snapshots(table, cloud_last)

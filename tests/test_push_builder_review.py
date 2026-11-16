@@ -19,7 +19,7 @@ T = "shop.orders"
 
 def test_a_name_collision_is_refused_before_the_table_is_scanned_or_hashed(cloud, device, catalog, monkeypatch):
     catalog.write_table(T, rows(50))
-    cloud.tables[("ws_main", ("shop",), "orders")] = CloudTable("cid", "00000000-0000-0000-0000-000000000000", False)
+    cloud.tables[("ws_main", "shop__orders")] = CloudTable("cid", "00000000-0000-0000-0000-000000000000", False)
 
     def must_not_run(*a, **kw):
         raise AssertionError("the local table was scanned")
@@ -79,7 +79,7 @@ def test_session_not_open_on_abort_counts_as_ended_and_the_push_goes_on(cloud, d
 
 def test_the_cloud_table_name_follows_the_receiver():
     assert cloud_table_name("shop", "orders") == "shop__orders"
-    assert cloud_table_name("main", "orders") == "main__orders"
+    assert cloud_table_name("main", "orders") == "orders"
     assert cloud_table_name("default", "orders") == "orders"
 
 
@@ -99,3 +99,19 @@ def test_push_prints_the_cloud_table_name(cloud, catalog, capsys, monkeypatch, s
     assert "workspace ws_main, cloud table shop__orders" in capsys.readouterr().out
     assert main(["push", T, "--home", str(home)]) == 0
     assert "up to date in workspace ws_main, cloud table shop__orders" in capsys.readouterr().out
+
+
+def test_main_x_and_default_x_share_a_cloud_name_and_the_second_is_refused_clearly(cloud, device, catalog):
+    catalog.write_table("main.x", rows(20))
+    catalog.write_table("default.x", rows(20, 20))
+    first = make_pusher(catalog, device, cloud).push("main.x")
+    assert first.cloud_name == "x"
+    cloud.log.clear()
+    with pytest.raises(CloudError) as e:
+        make_pusher(catalog, device, cloud).push("default.x")
+    assert e.value.code == "history_diverged" and "the cloud table x was pushed from another local table" in str(
+        e.value.problem["detail"]
+    )
+    assert e.value.problem["resolution"][0]["action"] == "use_new_table_name"
+    assert cloud.calls("POST", "/pushes") == [] and cloud.calls("PATCH") == []
+    assert make_pusher(catalog, device, cloud).push("default.x", target="default.x2").cloud_name == "x2"
