@@ -38,9 +38,27 @@ def test_the_reviewed_table_matches_what_is_installed_here():
     wrong = {
         n: (table[n], got)
         for n in mod.lock_runtime_closure()
-        if (got := mod.installed_licence(n)) is not None and got != table[n]
+        if (got := mod.installed_licence(n)) is not None and not mod.consistent(table[n], got)
     }
     assert wrong == {}
+
+
+def test_old_releases_with_classifiers_only_are_checked_against_the_table_without_loosening_it():
+    """Python 3.10 resolves numpy, pandas and python-dateutil to releases that declare `BSD License` instead of an SPDX
+    expression. That is consistent with a BSD entry; any licence the table does not hold is still a mismatch."""
+    c = load().consistent
+    assert c("BSD-3-Clause", "BSD-3-Clause") and c("BSD-3-Clause", "BSD License")
+    assert c("BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0", "BSD License")  # the entry may be broader
+    assert c("Apache-2.0 AND BSD-3-Clause", "BSD License; Apache Software License")
+    assert not c("BSD-3-Clause", "BSD License; Apache Software License")  # a licence the entry does not hold
+    assert c("Apache-2.0 AND BSD-3-Clause", "BSD-3-Clause")  # one release declares less than the union
+    assert not c("BSD-3-Clause", "Apache-2.0 AND BSD-3-Clause") and not c(
+        "BSD-3-Clause", "BSD-3-Clause AND GPL-3.0-only"
+    )
+    assert not c("MIT", "BSD License") and not c("Apache-2.0", "BSD License")
+    assert not c("BSD-3-Clause", "GNU General Public License v3 (GPLv3)")  # unknown classifier
+    assert not c("MIT", "BSD-3-Clause")
+    assert not c("BSD-3-Clause", "UNKNOWN")
 
 
 def test_the_inventory_is_complete_for_every_platform_and_covers_the_docker_image():

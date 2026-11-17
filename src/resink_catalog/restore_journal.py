@@ -17,8 +17,11 @@ Durability order (every step is fsynced before the next begins): staged files an
 `swapping`, then each rename together with BOTH of its parent directories, then the marker (`committed` or
 `rolled_back`), then the removal of the staging directory, then the removal of the journal. A journal is removed only
 after the recovery it describes has completed; if recovery fails it stays, so the next start retries.
-On Windows a directory cannot be opened for fsync, so that step is skipped there (NTFS journals metadata itself); file
-fsyncs still happen.
+On Windows a directory cannot be opened for fsync. Renames (the swap, its undo, the journal's own replace) are done
+with MoveFileExW and MOVEFILE_WRITE_THROUGH, which returns once the move is on disk, so the order above holds for them.
+What write-through does not cover is the creation of the staging directories and the removals in `cleanup`; their
+directory fsyncs are skipped. A lost creation leaves recovery nothing to move (it only moves what exists), and a lost
+removal leaves garbage behind: neither can make recovery act on a marker whose renames are missing.
 """
 
 from __future__ import annotations
@@ -41,8 +44,15 @@ def _hook(point: str) -> None:
     """Named points in recovery and rollback; tests replace this to kill the process at each of them."""
 
 
+_POSIX = os.name == "posix"
+
+
 def fsync_file(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
+    """Flush a file's data to disk. Windows only flushes a handle that was opened for writing (`fsync` on a read-only
+    one fails with EBADF), so it gets one. If that cannot be opened, the error is raised: not being able to flush a
+    file is not evidence that it is already durable, and restore must stop rather than carry on without it."""
+    flags = os.O_RDONLY if _POSIX else os.O_RDWR | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags)
     try:
         os.fsync(fd)
     finally:
@@ -50,8 +60,9 @@ def fsync_file(path: Path) -> None:
 
 
 def fsync_dir(path: Path) -> None:
-    """Make a directory's entries (creations, renames, removals) durable. Not possible on Windows: skipped there."""
-    if os.name != "posix":
+    """Make a directory's entries (creations, renames, removals) durable. A directory cannot be opened for fsync on
+    Windows: skipped there (renames use write-through in `_move`), kept on POSIX."""
+    if not _POSIX:
         return
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -69,12 +80,34 @@ def fsync_tree(path: Path) -> None:
     fsync_dir(Path(path).parent)
 
 
+MOVEFILE_REPLACE_EXISTING = 0x1
+MOVEFILE_WRITE_THROUGH = 0x8
+
+
+def _move_file_ex(src: str, dst: str, flags: int) -> None:
+    """Windows `MoveFileExW`; with MOVEFILE_WRITE_THROUGH it returns only once the move has been flushed to disk."""
+    import ctypes
+
+    if not ctypes.windll.kernel32.MoveFileExW(src, dst, flags):  # type: ignore[attr-defined]
+        raise ctypes.WinError()  # type: ignore[attr-defined]
+
+
+def _move(src: Path, dst: Path, replace: bool) -> None:
+    """Rename `src` to `dst` and return only when that is on disk. POSIX: the rename, then both parent directories
+    are fsynced (they may differ). Windows: a directory cannot be fsynced, so the move is done write-through instead,
+    which makes the rename durable before it returns. `replace` allows an existing file at `dst` (not a directory)."""
+    if _POSIX:
+        (os.replace if replace else os.rename)(src, dst)
+        fsync_dir(Path(dst).parent)
+        if Path(src).parent != Path(dst).parent:
+            fsync_dir(Path(src).parent)
+    else:
+        _move_file_ex(str(src), str(dst), MOVEFILE_WRITE_THROUGH | (MOVEFILE_REPLACE_EXISTING if replace else 0))
+
+
 def durable_rename(src: Path, dst: Path) -> None:
-    """A rename that is on disk when it returns: both parent directories are fsynced (they may be different)."""
-    os.rename(src, dst)
-    fsync_dir(Path(dst).parent)
-    if Path(src).parent != Path(dst).parent:
-        fsync_dir(Path(src).parent)
+    """A rename (it fails if `dst` exists) that is on disk when it returns."""
+    _move(src, dst, replace=False)
 
 
 def write_journal(home: Path, data: dict) -> None:
@@ -83,8 +116,7 @@ def write_journal(home: Path, data: dict) -> None:
         json.dump(data, f)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, home / JOURNAL)
-    fsync_dir(home)  # make the rename itself durable
+    _move(tmp, home / JOURNAL, replace=True)  # the rename itself is durable when this returns
 
 
 def read_journal(home: Path) -> dict | None:

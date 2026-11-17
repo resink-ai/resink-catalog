@@ -199,6 +199,38 @@ def installed_licence(name: str) -> str | None:
     return ALIASES.get(found, found)
 
 
+# Releases of one package declare their licence in different ways: newer ones with an SPDX `License-Expression`, older
+# ones (the versions Python 3.10 resolves to) with trove classifiers only, which are coarse ("BSD License" is any of
+# three licences). The reviewed table is the authority for the policy; installed metadata must be CONSISTENT with it.
+CLASSIFIER_IDS = {
+    "BSD License": {"BSD-2-Clause", "BSD-3-Clause", "0BSD"},
+    "MIT License": {"MIT", "MIT-0"},
+    "Apache Software License": {"Apache-2.0"},
+    "Python Software Foundation License": {"PSF-2.0"},
+    "ISC License (ISCL)": {"ISC"},
+    "Mozilla Public License 2.0 (MPL 2.0)": {"MPL-2.0"},
+}
+
+
+def licence_ids(expression: str) -> set[str]:
+    return {t for t in re.split(r"\s+(?:AND|OR|WITH)\s+|[()]|\s{2,}", expression) if t.strip()}
+
+
+def consistent(reviewed_entry: str, declared: str) -> bool:
+    """Is what an installed distribution declares (`installed_licence`) compatible with the reviewed entry?
+    The entry is the union over the locked versions of a package (one release may declare less than another), so
+    every licence an installed release declares must be in it: an SPDX expression by its identifiers, classifier-only
+    metadata (`A; B`) by classifier family, where an unknown classifier is a mismatch. The entry may be broader than
+    one release (it was reviewed from the licence files). A licence the table lacks is never accepted."""
+    if declared == reviewed_entry or (declared and licence_ids(declared) <= licence_ids(reviewed_entry)):
+        return True
+    parts = [c.strip() for c in declared.split(";")]
+    if not all(c in CLASSIFIER_IDS for c in parts):
+        return False
+    have = licence_ids(reviewed_entry)
+    return all(CLASSIFIER_IDS[c] & have for c in parts)
+
+
 if __name__ == "__main__":
     if "--markdown" in sys.argv:
         print(markdown(), end="")

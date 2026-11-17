@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -11,13 +12,21 @@ from pyiceberg.catalog.sql import SqlCatalog
 DEFAULT_NAMESPACE = "main"  # DuckDB's own default schema; "default" is an SQL keyword and cannot be written bare
 
 
+def warehouse_location(warehouse: Path, *, windows: bool | None = None) -> str:
+    """The warehouse as PyIceberg wants it. A `file:///C:/x` URI is read back as the path `/C:/x` (WinError 123), but
+    PyIceberg takes a plain drive path (`C:\\x`) as a local file, so Windows gets that; elsewhere a `file://` URI."""
+    if windows is None:
+        windows = os.name == "nt"
+    return str(warehouse) if windows else warehouse.as_uri()
+
+
 def open_iceberg(home: Path) -> IcebergCatalog:
     warehouse = home / "warehouse"
     warehouse.mkdir(parents=True, exist_ok=True)
     return SqlCatalog(
         "local",
         uri=f"sqlite:///{home / 'catalog.db'}",
-        warehouse=warehouse.as_uri(),
+        warehouse=warehouse_location(warehouse),
     )
 
 
