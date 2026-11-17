@@ -79,22 +79,30 @@ def test_an_unusable_native_store_fails_closed_even_if_keyring_has_another_backe
         open_store("darwin", env={})
 
 
-def test_linux_has_no_os_store_so_it_fails_closed(monkeypatch, tmp_path):
-    monkeypatch.setenv("RESINK_CATALOG_CREDENTIALS_DIR", str(tmp_path))
-    with pytest.raises(NoSecureStore, match="RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS"):
-        open_store("linux", env={})
-    assert not list(tmp_path.iterdir())  # nothing was written
+def test_linux_uses_a_private_file_by_default_and_warns_once(monkeypatch, tmp_path, capsys):
+    """Decision 11: no native store on Linux, so a 0600 file in a 0700 directory, without any opt-in."""
+    import resink_catalog.credentials as credentials
 
-
-def test_the_plaintext_file_is_an_explicit_opt_in_with_a_warning(monkeypatch, tmp_path, caplog):
-    monkeypatch.setenv("RESINK_CATALOG_CREDENTIALS_DIR", str(tmp_path))
-    with caplog.at_level("WARNING"):
-        store = open_store("linux", env={"RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS": "1"})
-    assert isinstance(store, FileStore) and store.path == tmp_path / "credentials.json"
-    assert "plaintext" in caplog.text
+    monkeypatch.setattr(credentials, "_warned", False)
+    monkeypatch.setenv("RESINK_CATALOG_CREDENTIALS_DIR", str(tmp_path / "cfg"))
+    store = open_store("linux", env={})
+    open_store("linux", env={})
+    assert isinstance(store, FileStore) and store.path == tmp_path / "cfg" / "credentials.json"
+    out, err = capsys.readouterr()
+    assert out == "" and err.count("no OS credential store on linux") == 1  # stderr, once; never stdout
     store.set("device", "t")
     if os.name == "posix":
         assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
+
+
+def test_macos_with_an_unusable_store_refuses_unless_the_file_is_opted_in(monkeypatch, tmp_path):
+    monkeypatch.setenv("RESINK_CATALOG_CREDENTIALS_DIR", str(tmp_path))
+    fake_backend_modules(monkeypatch, priority=0)
+    with pytest.raises(NoSecureStore, match="RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS"):
+        open_store("darwin", env={})
+    assert not list(tmp_path.iterdir())  # nothing was written
+    assert isinstance(open_store("darwin", env={"RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS": "1"}), FileStore)
 
 
 def test_windows_never_gets_the_plaintext_file(monkeypatch):
@@ -108,7 +116,7 @@ def test_tokens_never_reach_catalog_db_or_a_backup(tmp_path, monkeypatch):
     home = tmp_path / "home"
     cat = Catalog(home)
     cat.write_table("t", pd.DataFrame({"a": [1]}))
-    open_store("linux", env={"RESINK_CATALOG_ALLOW_PLAINTEXT_CREDENTIALS": "1"}).set("device", "SECRET-DEVICE-TOKEN")
+    open_store("linux", env={}).set("device", "SECRET-DEVICE-TOKEN")
     backup(home, tmp_path / "bk")
     for f in [home / "catalog.db", *(tmp_path / "bk").rglob("*")]:
         if f.is_file():

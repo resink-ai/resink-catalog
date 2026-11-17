@@ -9,7 +9,7 @@ from contextlib import closing
 from pathlib import Path
 
 HOME_ENV = "RESINK_CATALOG_HOME"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 # Our own tables (design section 5). Iceberg metadata lives in PyIceberg's SQL catalog tables in the same file.
@@ -48,6 +48,25 @@ CREATE TABLE IF NOT EXISTS notes (
     body TEXT NOT NULL,
     author TEXT NOT NULL CHECK (author IN ('user', 'ai')),
     created_at TEXT NOT NULL
+);
+-- push client (L5a): a cache for display only; the cloud's table-state is the truth. Never holds credentials.
+CREATE TABLE IF NOT EXISTS push_state (
+    table_name TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    target TEXT NOT NULL,
+    cloud_table_id TEXT,
+    last_pushed_snapshot_id INTEGER,
+    pushed_at TEXT NOT NULL,
+    PRIMARY KEY (table_name, workspace_id, target)
+);
+-- push client: the last ended session of the idempotency chain for the body being pushed (push.py)
+CREATE TABLE IF NOT EXISTS push_chain (
+    table_name TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    target TEXT NOT NULL,
+    body_digest TEXT NOT NULL,
+    previous TEXT NOT NULL,
+    PRIMARY KEY (table_name, workspace_id, target)
 );
 """
 
