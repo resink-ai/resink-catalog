@@ -77,11 +77,30 @@ def read_csv(path: Path) -> pa.Table:
         raise ReadError("the file is empty")
     with tempfile.TemporaryDirectory() as tmp:
         utf8 = Path(tmp) / "data.csv"  # DuckDB reads UTF-8 only without extensions; transcode once
-        utf8.write_text(text, encoding="utf-8", newline="")
+
+        def parse(content: str) -> pa.Table:
+            utf8.write_text(content, encoding="utf-8", newline="")
+            return duckdb.read_csv(str(utf8), sample_size=-1, ignore_errors=False).to_arrow_table()
+
         try:
-            table = duckdb.read_csv(str(utf8), sample_size=-1, ignore_errors=False).to_arrow_table()
+            table = parse(text)
         except duckdb.Error as e:
-            raise ReadError(f"not a readable CSV: {str(e).splitlines()[0].replace(str(utf8), path.name)}") from e
+            # `\r\r\n` is what a CRLF file becomes after one more text-mode newline translation (Windows tools do
+            # this), and DuckDB's sniffer fails on it for a file without data rows. It is repaired only in a file
+            # with no quote character, where every such sequence is a record separator. With quotes it could be
+            # inside a value, so the file is refused rather than imported with altered data.
+            msg = str(e).splitlines()[0].replace(str(utf8), path.name)
+            if "\r\r" not in text:
+                raise ReadError(f"not a readable CSV: {msg}") from e
+            if '"' in text:
+                raise ReadError(
+                    "not a readable CSV: it has doubled carriage returns (`\\r\\r\\n` line endings) and quoted "
+                    "values, so they cannot be told from data; save it again with ordinary line endings"
+                ) from e
+            try:
+                table = parse(re.sub(r"\r{2,}\n", "\r\n", text))
+            except duckdb.Error:
+                raise ReadError(f"not a readable CSV: {msg}") from e
     if table.num_columns == 0:
         raise ReadError("the file is empty")
     if table.num_columns == 1 and re.search(r"[,;\t|]", table.schema.names[0]):

@@ -94,7 +94,7 @@ def generate(out: Path, seed: int = 7) -> list[Expected]:
         _write_csv(out / f"newline_{L[i]}.csv", rows, quote_names=True)
         add(f"newline_{L[i]}.csv", "quoted-newline", rows)
     for i in range(3):  # header only, no data rows
-        (out / f"headeronly_{L[i]}.csv").write_text(",".join(head) + "\r\n")
+        (out / f"headeronly_{L[i]}.csv").write_bytes((",".join(head) + "\r\n").encode())  # CRLF on every OS
         add(f"headeronly_{L[i]}.csv", "header-only", [])
     for i in range(3):  # three date formats in one column
         rows = _rows(rng, 9, ASCII_NAMES)

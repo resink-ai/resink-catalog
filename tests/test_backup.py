@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -583,9 +584,11 @@ def test_the_durability_order_staged_data_then_journal_then_renames_with_both_pa
     assert len(renames) == 4 and renames[0] > first_journal  # no rename before the journal is durable
     assert events[kinds.index("journal", first_journal + 1)] == ("journal", "committed")
     assert kinds.index("journal", first_journal + 1) > renames[-1]  # the marker comes after every rename
-    # each rename is followed by an fsync of its parent directory (both, when they differ) before the next step
-    for i in renames:
-        assert events[i + 1][0] == "fsync_dir"
+    # POSIX: each rename is followed by an fsync of its parent directory (both, when they differ) before the next
+    # step. Windows has no directory fsync; there the rename itself is write-through (test_windows_paths).
+    if sys.platform != "win32":
+        for i in renames:
+            assert events[i + 1][0] == "fsync_dir"
     assert not list(home.glob(".restore-journal.json"))  # removed last
 
 
@@ -628,3 +631,43 @@ def test_an_uncertain_commit_marker_is_never_rolled_back_in_process(cat, home, t
     c.close()
     assert not (home / ".restore-journal.json").exists() and not list(home.glob(".restore-stage-*"))
     assert list(home.glob(".restore-replaced-*/catalog.db"))  # the old catalog is kept, as for any committed restore
+
+
+# ------------------------------------------------------------------ Windows locations (simulated: CI runs the real thing)
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("file:///C:/Users/x/warehouse/a/b.json", "C:/Users/x/warehouse/a/b.json"),  # what an old pyiceberg stored
+        ("C:\\Users\\x\\warehouse\\a\\b.json", "C:\\Users\\x\\warehouse\\a\\b.json"),  # plain drive path
+        ("C:/Users/x/warehouse/a b.json", "C:/Users/x/warehouse/a b.json"),
+        ("file:///C:/Users/x/a%20b.json", "C:/Users/x/a b.json"),
+        ("file:///home/x/warehouse/a.json", "/home/x/warehouse/a.json"),
+    ],
+)
+def test_local_path_reads_windows_locations_on_windows(location, expected):
+    from resink_catalog.backup import _local_path
+
+    assert str(_local_path(location, windows=True)).replace("\\", "/") == expected.replace("\\", "/")
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("file:///C:/warehouse/a.json", "/C:/warehouse/a.json"),  # an absolute path whose first directory is `C:`
+        ("file:///home/x/warehouse/a%20b.json", "/home/x/warehouse/a b.json"),
+        ("/home/x/warehouse/a.json", "/home/x/warehouse/a.json"),
+    ],
+)
+def test_local_path_keeps_posix_semantics_on_posix(location, expected):
+    from resink_catalog.backup import _local_path
+
+    assert _local_path(location, windows=False).as_posix() == expected
+
+
+def test_local_path_refuses_remote_locations():
+    from resink_catalog.backup import BackupError, _local_path
+
+    with pytest.raises(BackupError):
+        _local_path("s3://bucket/key")

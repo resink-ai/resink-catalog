@@ -59,7 +59,7 @@ Anything else (GPL, AGPL, SSPL, source-available, unknown) fails the test.
 | pyjwt | 2.15.1 | MIT |
 | pyparsing | 3.3.3 | MIT |
 | pyroaring | 1.2.0 | MIT |
-| python-dateutil | 3.0.0, 4.0.0 | BSD-3-Clause |
+| python-dateutil | 3.0.0, 4.0.0 | Apache-2.0 AND BSD-3-Clause |
 | python-multipart | 0.0.32, 0.0.33 | Apache-2.0 |
 | pytz | 2026.6 | MIT |
 | pywin32 | 312 | PSF-2.0 |

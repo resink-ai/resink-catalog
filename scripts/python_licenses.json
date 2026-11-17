@@ -45,7 +45,7 @@
   "pyjwt": "MIT",
   "pyparsing": "MIT",
   "pyroaring": "MIT",
-  "python-dateutil": "BSD-3-Clause",
+  "python-dateutil": "Apache-2.0 AND BSD-3-Clause",
   "python-multipart": "Apache-2.0",
   "pytz": "MIT",
   "pywin32": "PSF-2.0",
