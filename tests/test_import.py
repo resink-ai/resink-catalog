@@ -1,5 +1,7 @@
 """L1 acceptance 1 and 2: one CSV becomes an Iceberg table; re-import is a no-op unless content changed."""
 
+from pathlib import Path
+
 import pandas as pd
 import pytest
 from pyiceberg.table import StaticTable  # noqa: F401  (documents that tables are plain Iceberg)
@@ -107,9 +109,9 @@ def test_scan_finds_changed_missing_and_new_files(tmp_path, catalog):
     b.unlink()
     _csv(folder / "c.csv", ["9,n,9"])
     report = catalog.scan()
-    assert [p.rsplit("/", 1)[-1] for p in report["changed"]] == ["a.csv"]
-    assert [p.rsplit("/", 1)[-1] for p in report["missing"]] == ["b.csv"]
-    assert [p.rsplit("/", 1)[-1] for p in report["new"]] == ["c.csv"]
+    assert [Path(p).name for p in report["changed"]] == ["a.csv"]
+    assert [Path(p).name for p in report["missing"]] == ["b.csv"]
+    assert [Path(p).name for p in report["new"]] == ["c.csv"]
     applied = catalog.scan(apply=True)
     assert applied["imported"][0]["outcome"] == "updated"
     assert len(catalog.read_table("exports.a")) == 2

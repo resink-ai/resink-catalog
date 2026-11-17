@@ -32,7 +32,13 @@ test("a folder of exports becomes tables you can inspect and query, in both them
   await review.getByLabel("Type of amount").selectOption("string");
   await expect(review.getByText("inferred double")).toBeVisible();
   await review.getByRole("button", { name: "Import this file" }).click();
-  await expect(page.getByRole("status")).toContainText("1 imported, 0 failed");
+  try {
+    await expect(page.getByRole("status")).toContainText("1 imported, 0 failed");
+  } catch (e) {
+    // say WHY the import failed (the page shows the server's reason in its alert) instead of only that it did
+    const why = await page.getByRole("alert").allInnerTexts();
+    throw new Error(`${(e as Error).message}\nthe page's alert says: ${why.join(" | ") || "(no alert)"}`);
+  }
 
   // L2.1 schema, sample rows, snapshot history
   await nav.getByRole("link", { name: "Tables" }).click();

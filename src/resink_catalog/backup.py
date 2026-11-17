@@ -15,14 +15,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import shutil
 import sqlite3
 import tempfile
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlparse
-from urllib.request import url2pathname
+from urllib.parse import unquote, urlparse
 
 from .catalog import Catalog
 from .home import SCHEMA_VERSION
@@ -38,11 +39,23 @@ class BackupError(Exception):
     """A backup or restore that cannot proceed; the message says what to do."""
 
 
-def _local_path(uri: str) -> Path:
+_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _local_path(uri: str, *, windows: bool | None = None) -> Path:
+    """The local path of a stored location: a `file:` URI (`file:///C:/x` or `file:///home/x`) or a plain path
+    (`C:\\x` on Windows, where PyIceberg's warehouse is one). The drive form is only read as a drive on Windows; on
+    POSIX `file:///C:/x` is the absolute path `/C:/x`."""
+    windows = os.name == "nt" if windows is None else windows
+    if windows and _DRIVE.match(uri):  # `C:\x`: urlparse would take `C` for a scheme
+        return Path(uri)
     parsed = urlparse(uri)
     if parsed.scheme not in ("", "file"):
         raise BackupError(f"cannot back up {uri}: only local files are supported")
-    return Path(url2pathname(parsed.path))  # file:///C:/x on Windows, file:///home/x elsewhere
+    path = unquote(parsed.path)
+    if windows and re.match(r"^/[A-Za-z]:[\\/]", path):  # file:///C:/x -> C:/x
+        path = path[1:]
+    return Path(path)
 
 
 def referenced_files(cat: Catalog) -> set[Path]:
