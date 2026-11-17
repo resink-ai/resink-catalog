@@ -27,7 +27,7 @@ DOC_ERRORS = {
         "confirmation_required",  # added after the design text: commit of an over_included session without confirmation
         "session_not_open",  # added after the design text: abort of a committed or failed session (TASK-23, finding 4)
     },
-    410: {"session_expired"},
+    410: {"session_expired", "workspace_deleted"},  # workspace_deleted: a push to a deleted workspace
     413: {"file_too_large", "storage_ceiling"},
     422: {"checksum_mismatch", "unsupported_table_feature", "invalid_parquet"},
     423: {"workspace_paused"},
