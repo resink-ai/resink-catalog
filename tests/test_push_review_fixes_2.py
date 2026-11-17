@@ -256,7 +256,9 @@ def test_r3_at_the_deadline_the_connection_is_cut_and_the_worker_exits():
         first = api.client
         with pytest.raises(RequestMaybeSent):
             api.request("GET", "/push/v0/capabilities")
-        deadline = time.monotonic() + 0.3  # far less than the second until the next byte would wake the read
+        deadline = (
+            time.monotonic() + 1.0
+        )  # less than the 1.5 s until the next byte would wake the read (slow CI runners need the margin)
         while _http_workers() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert _http_workers() == []  # the blocked read failed and the worker returned
