@@ -194,6 +194,7 @@ def test_tokens_are_never_in_catalog_db(cloud, device, store, catalog, home):
     catalog.write_table("shop.orders", rows(50))
     make_pusher(catalog, device, cloud).push("shop.orders")
     secrets_ = [store.get("access_token"), store.get("refresh_token")]
+    catalog.close()  # Windows: an open SQLite file cannot be read by another handle
     for p in home.rglob("*"):
         if p.is_file():
             data = p.read_bytes()
