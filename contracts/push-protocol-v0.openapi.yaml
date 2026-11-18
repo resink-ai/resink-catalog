@@ -221,6 +221,7 @@ paths:
                   - $ref: '#/components/schemas/StorageCeilingProblem'
                   - $ref: '#/components/schemas/Problem'
         '422': {$ref: '#/components/responses/Problem'}
+        '410': {$ref: '#/components/responses/WorkspaceDeleted'}
         '423': {$ref: '#/components/responses/WorkspacePaused'}
         '429': {$ref: '#/components/responses/RateLimited'}
         '503': {$ref: '#/components/responses/Unavailable'}
@@ -353,7 +354,7 @@ paths:
           content:
             application/problem+json:
               schema: {$ref: '#/components/schemas/Problem'}
-        '410': {$ref: '#/components/responses/Problem'}
+        '410': {$ref: '#/components/responses/WorkspaceDeleted'}
         '413':
           description: The re-check at commit found a ceiling exceeded (it was lowered meanwhile). Code `storage_ceiling`.
           content:
@@ -402,6 +403,13 @@ components:
   responses:
     Problem:
       description: Problem document. See `code` for the specific error (design section 8).
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    WorkspaceDeleted:
+      description: >-
+        `workspace_deleted`: the workspace was deleted. Its data is removed after the grace period; nothing can be
+        pushed to it. (`session_expired` also uses 410 on commit; the `code` says which.)
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
@@ -459,6 +467,7 @@ components:
         - unsupported_table_feature
         - invalid_parquet
         - workspace_paused
+        - workspace_deleted
         - rate_limited
         - unavailable
     Problem:
